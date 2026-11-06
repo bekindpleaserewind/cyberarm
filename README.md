@@ -4,10 +4,16 @@
 
 # OpenClaw AI Robotic Arm
 
-Control a [CyberBrick](https://makerworld.com/en/cyberbrick) desktop robotic arm from your
-PC and let an [OpenClaw](https://github.com/openclaw/openclaw) AI agent drive it in plain
-language: *"turn left a bit and open the claw"*, *"pick up the block on the right and hand
-it to me"*, *"wave"*.
+Control the [Robotic Arm - CyberBrick](https://makerworld.com/en/models/3379322-robotic-arm-cyberbrick)
+from your PC and let an [OpenClaw](https://github.com/openclaw/openclaw) AI agent drive it
+in plain language: *"turn left a bit and open the claw"*, *"pick up the block on the right
+and hand it to me"*, *"wave"*.
+
+> **The arm:** this project was built for the
+> [Robotic Arm - CyberBrick](https://makerworld.com/en/models/3379322-robotic-arm-cyberbrick)
+> model on MakerWorld, a 3D-printed desktop arm powered by the
+> [CyberBrick](https://makerworld.com/en/cyberbrick) electronics kit. Print and assemble
+> it from that page first, then use this project to control it from your PC or an AI agent.
 
 The project has three parts:
 
@@ -61,6 +67,11 @@ stops the claw and base when they reach their targets.
 
 ## Hardware
 
+The code is written for the
+[Robotic Arm - CyberBrick](https://makerworld.com/en/models/3379322-robotic-arm-cyberbrick)
+model from MakerWorld. Print and build it as described on the model page, then wire it to
+the CyberBrick receiver like this:
+
 | Port on receiver | Part      | Type                                       |
 | ---------------- | --------- | ------------------------------------------ |
 | S1               | Lower arm | 180° servo                                 |
@@ -75,6 +86,10 @@ You also need:
 
 Tested on Linux (WSL, `/dev/ttyACM0`). The driver also supports Windows (`COM5` etc.) and
 macOS.
+
+If you built a different CyberBrick arm, or wired it differently, change the port numbers
+and joint limits in the `CONFIG` section of
+[src/cyberbrick_arm.py](src/cyberbrick_arm.py). Then run `arm_serial.py install`.
 
 ## Quick start
 
@@ -143,7 +158,7 @@ See [openclaw-plugin/README.md](openclaw-plugin/README.md) for the tool list and
 ```
 .
 ├── contrib/
-│   └── cyberarm.jpeg          header image
+│   └── cyberarm.png           header image
 ├── src/
 │   ├── cyberbrick_arm.py      MicroPython arm library (runs on the board)
 │   ├── arm_serial.py          PC driver / CLI
@@ -168,6 +183,8 @@ See [openclaw-plugin/README.md](openclaw-plugin/README.md) for the tool list and
 
 ## Acknowledgements
 
+- Arm design: [Robotic Arm - CyberBrick](https://makerworld.com/en/models/3379322-robotic-arm-cyberbrick)
+  on MakerWorld.
 - The serial connection code follows the approach of
   [unbug/CyberClaw](https://github.com/unbug/CyberClaw)'s CyberBrick driver.
 - Built on the CyberBrick MicroPython firmware and its `bbl` servo and motor libraries.
