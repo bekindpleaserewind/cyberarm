@@ -3,7 +3,7 @@
 Lets an OpenClaw agent control the CyberBrick robotic arm: turn the base (never more than
 90° left or right of centre), move the two arm joints, and open or close the claw.
 
-The tools run the PC driver `../src/arm_serial.py`, which talks to the arm's receiver board
+The tools run the PC driver `./src/arm_serial.py`, which talks to the arm's receiver board
 over USB serial.
 
 ## Tools
@@ -34,9 +34,8 @@ board library itself (`BASE_LIMIT_DEG` in `src/cyberbrick_arm.py`).
 1. Prepare the arm (receiver board plugged into USB, battery on):
 
    ```bash
-   cd ~/Cyberbrick/src
-   .venv/bin/python arm_serial.py install          # store the arm library on the board
-   .venv/bin/python arm_serial.py base-calibrate   # time 90° turns (needed once)
+   python arm_serial.py install          # store the arm library on the board
+   python arm_serial.py base-calibrate   # time 90° turns (needed once)
    ```
 
    `base-calibrate` is interactive: centre the base, then press Enter when it has turned
@@ -46,9 +45,9 @@ board library itself (`BASE_LIMIT_DEG` in `src/cyberbrick_arm.py`).
 2. Install the plugin:
 
    ```bash
-   cd ~/Cyberbrick/openclaw-plugin
+   cd ./openclaw-plugin
    npm install
-   openclaw plugins install --link ~/Cyberbrick/openclaw-plugin
+   openclaw plugins install --link /path/to/openclaw-plugin
    ```
 
 3. Allow its tools. The `coding` tool profile only includes built-in tools, so add the
@@ -76,7 +75,7 @@ Optional, under `plugins.entries.cyberbrick-arm.config`:
 
 | Key              | Default                                         |
 | ---------------- | ----------------------------------------------- |
-| `driverPath`     | `../src/arm_serial.py` next to this plugin      |
+| `driverPath`     | `./src/arm_serial.py` next to this plugin      |
 | `python`         | `.venv/bin/python` next to the driver, else `python3` |
 | `port`           | auto-detect (e.g. `/dev/ttyACM0`, `COM5`)       |
 | `timeoutSeconds` | `90`                                            |
