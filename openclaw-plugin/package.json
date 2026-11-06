@@ -1,0 +1,29 @@
+{
+  "name": "cyberbrick-arm",
+  "version": "0.1.0",
+  "description": "OpenClaw plugin that drives a CyberBrick robotic arm (base, arm joints, claw) over USB serial.",
+  "private": true,
+  "type": "module",
+  "license": "MIT",
+  "files": [
+    "index.ts",
+    "openclaw.plugin.json",
+    "skills",
+    "README.md"
+  ],
+  "dependencies": {
+    "typebox": "^1.1.39"
+  },
+  "peerDependencies": {
+    "openclaw": ">=2026.3.24-beta.2"
+  },
+  "openclaw": {
+    "extensions": [
+      "./index.ts"
+    ],
+    "compat": {
+      "pluginApi": ">=2026.3.24-beta.2",
+      "minGatewayVersion": "2026.3.24-beta.2"
+    }
+  }
+}

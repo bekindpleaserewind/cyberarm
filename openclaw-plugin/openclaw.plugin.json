@@ -1,0 +1,54 @@
+{
+  "id": "cyberbrick-arm",
+  "name": "CyberBrick Arm",
+  "description": "Control a CyberBrick robotic arm over USB: turn the base (max 90 degrees left or right of centre), move the arm joints, and open or close the claw.",
+  "version": "0.1.0",
+  "categories": ["other"],
+  "activation": {
+    "onStartup": true
+  },
+  "skills": ["skills"],
+  "contracts": {
+    "tools": [
+      "cyberbrick_arm_status",
+      "cyberbrick_arm_rotate_base",
+      "cyberbrick_arm_face_angle",
+      "cyberbrick_arm_open_claw",
+      "cyberbrick_arm_close_claw",
+      "cyberbrick_arm_set_claw",
+      "cyberbrick_arm_move",
+      "cyberbrick_arm_home",
+      "cyberbrick_arm_stop"
+    ]
+  },
+  "configSchema": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {
+      "driverPath": {
+        "type": "string",
+        "description": "Path to arm_serial.py. Default: ../src/arm_serial.py next to this plugin."
+      },
+      "python": {
+        "type": "string",
+        "description": "Python interpreter with pyserial installed. Default: the .venv next to arm_serial.py if there is one, otherwise python3."
+      },
+      "port": {
+        "type": "string",
+        "description": "Serial port of the arm's receiver board, e.g. /dev/ttyACM0 or COM5. Default: auto-detect."
+      },
+      "timeoutSeconds": {
+        "type": "number",
+        "minimum": 5,
+        "maximum": 600,
+        "description": "Longest time one arm command may take. Default: 90."
+      }
+    }
+  },
+  "uiHints": {
+    "driverPath": { "label": "Driver script (arm_serial.py)" },
+    "python": { "label": "Python interpreter" },
+    "port": { "label": "Serial port", "placeholder": "auto-detect" },
+    "timeoutSeconds": { "label": "Command timeout (seconds)" }
+  }
+}
