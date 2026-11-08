@@ -1,7 +1,7 @@
 {
   "id": "cyberbrick-arm",
   "name": "CyberBrick Arm",
-  "description": "Control a CyberBrick robotic arm over USB: turn the base (max 90 degrees left or right of centre), move the arm joints, and open or close the claw.",
+  "description": "Control a CyberBrick robotic arm over the radio (through the CyberBrick remote) or USB: turn the base (max 90 degrees left or right of centre), move the arm joints, and open or close the claw.",
   "version": "0.1.0",
   "categories": ["other"],
   "activation": {
@@ -35,7 +35,12 @@
       },
       "port": {
         "type": "string",
-        "description": "Serial port of the arm's receiver board, e.g. /dev/ttyACM0 or COM5. Default: auto-detect."
+        "description": "Serial port to use: the CyberBrick remote's in radio mode, the arm's receiver otherwise, e.g. /dev/ttyACM0 or COM5. Default: auto-detect."
+      },
+      "transport": {
+        "type": "string",
+        "enum": ["auto", "radio", "usb"],
+        "description": "How commands reach the arm. radio: through the paired CyberBrick remote; usb: the arm's own USB cable. Default auto: radio once 'arm_serial.py radio-install' was run."
       },
       "timeoutSeconds": {
         "type": "number",
@@ -49,6 +54,7 @@
     "driverPath": { "label": "Driver script (arm_serial.py)" },
     "python": { "label": "Python interpreter" },
     "port": { "label": "Serial port", "placeholder": "auto-detect" },
+    "transport": { "label": "Link to the arm", "placeholder": "auto" },
     "timeoutSeconds": { "label": "Command timeout (seconds)" }
   }
 }

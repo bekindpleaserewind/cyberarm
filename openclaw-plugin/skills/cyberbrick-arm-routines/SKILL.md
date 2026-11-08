@@ -19,12 +19,12 @@ All base angles stay within **-90 (left) .. 90 (right)**. Never plan a step outs
    how far (degrees) to the side.
 3. Use joint `speed` 15-20 while carrying something so it does not get flung.
 
-The "reach" and "lift" poses below use **REACH** and **LIFT** placeholders. Use the joint
-directions from the `cyberbrick-arm` skill notes (or that you learned with the user) to
-choose them. Start with REACH = lower 120 / upper 60 and LIFT = lower 90 / upper 90 only if
-the user confirms higher lower-arm angles lean forward; otherwise mirror them (lower 60 /
-upper 120). Adjust in steps of 10 degrees based on the user's feedback, and reuse what
-works for the rest of the conversation.
+Joint positions run from 0 (home, folded) to 180 (fully extended); see the
+`cyberbrick-arm` skill. The "reach" and "lift" poses below use **REACH** and **LIFT**
+placeholders. Start with REACH = lower 100 / upper 140 (stretched out towards the table)
+and LIFT = lower 60 / upper 90 (raised, clear of the table). Use the directions from
+`cyberbrick_arm_status` to check they go the right way. Adjust in steps of 10 based on the
+user's feedback, and reuse what works for the rest of the conversation.
 
 ## Pick up
 
@@ -56,10 +56,16 @@ user to take it. Wait for them to confirm before `cyberbrick_arm_open_claw`, the
 
 ## Gestures
 
-- **Wave**: `cyberbrick_arm_move` upper 60 then upper 120, three times, speed 40; then
-  upper 90.
-- **Nod (yes)**: lower 80 then lower 100, twice, speed 30; then lower 90.
-- **Shake (no)**: face angle -20 then 20, twice; then face angle 0.
+Use `cyberbrick_arm_gesture` for wave, nod and shake: **one call** does the whole
+gesture. It raises the arm if needed, swings at one even speed and returns to the pose it
+started in. Do not build these from separate `cyberbrick_arm_move` calls: each call
+snaps, then the arm waits seconds for the next one, so it looks jerky and uneven.
+
+- **Wave**: `cyberbrick_arm_gesture` gesture `wave` (3 swings by default).
+- **Nod (yes)**: `cyberbrick_arm_gesture` gesture `nod`.
+- **Shake (no)**: `cyberbrick_arm_gesture` gesture `shake`.
+- Pass `times` for more or fewer swings, and `speed` (default 25) only if the user asks
+  for a faster or slower gesture.
 - **Scan / look around**: face angle -90, then 0, then 90, then 0. Pause one step at each.
 - **Clap**: open claw, close claw, twice.
 

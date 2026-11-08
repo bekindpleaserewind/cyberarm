@@ -17,10 +17,11 @@ https://makerworld.com/en/cyberbrick/api-doc/cyberbrick_core/lib/index.html):
 
 How to run
 ----------
-From a PC over the USB serial port (recommended):
-    python arm_serial.py --port COM5 demo   # see arm_serial.py for commands
+From a PC (recommended), over the radio link or the USB serial port:
+    python arm_serial.py demo               # see arm_serial.py for commands
 
-arm_serial.py uploads this file into the board's RAM and creates `arm` there.
+Over USB, arm_serial.py loads this file on the board and creates `arm` there.
+In radio mode, arm_radio.py starts it when the board boots.
 
 Standalone on the board:
     mpremote run cyberbrick_arm.py          # runs MODE below (default: demo)
@@ -38,7 +39,9 @@ Or copy it to the board and use it from the REPL:
 Calibration
 -----------
 The base motor and the 360 deg claw servo have no position feedback, so their
-movement is time-based. Tune the constants in the CONFIG section:
+movement is time-based. The constants in the CONFIG section are the defaults;
+the calibration commands save measured values in CAL_FILE on the board, which
+override them:
     * CLAW_OPEN_MS / CLAW_CLOSE_MS  full open / close time at CLAW_SPEED
                       (measure with `python arm_serial.py claw-calibrate`)
     * CLAW_START_OPEN whether the claw is open when the script starts
@@ -51,16 +54,24 @@ and the base never turns more than BASE_LIMIT_DEG either side of centre.
     * *_MIN / *_MAX   joint limits that keep the arm from hitting itself
 """
 
+import sys
 import time
 from machine import Timer
 
 try:
-    from bbl.servos import ServosController
-    from bbl.motors import MotorsController
-except ImportError:
-    # Fallback when the bbl files sit directly on sys.path (e.g. /bbl).
-    from servos import ServosController
-    from motors import MotorsController
+    # Reuse the servo/motor library the stock firmware has already loaded.
+    ServosController = sys.modules["bbl.servos"].ServosController
+    MotorsController = sys.modules["bbl.motors"].MotorsController
+except KeyError:
+    try:
+        # With /bbl on sys.path this loads just these two files, not the whole
+        # bbl package (LEDs, executor, sleep module), which saves RAM in radio
+        # mode (see arm_radio.py).
+        from servos import ServosController
+        from motors import MotorsController
+    except ImportError:
+        from bbl.servos import ServosController
+        from bbl.motors import MotorsController
 
 
 # =============================================================================
@@ -80,14 +91,30 @@ UPPER_ARM_SERVO = 2   # S2, 180 deg
 CLAW_SERVO = 3        # S3, 360 deg continuous
 BASE_MOTOR = 2        # M2
 
-# Joint limits and home pose (degrees, 0..180). Narrow these if the arm
-# can collide with itself or the base at the extremes.
+# Joint limits and home pose, in servo degrees (0..180). Narrow these if the
+# arm can collide with itself or the base at the extremes. `arm_serial.py
+# arm-calibrate` measures them and saves them on the board (CAL_FILE).
+#
+# Joint positions: when a joint's HOME is at one end of its MIN..MAX travel
+# (as arm-calibrate sets it), every command and status() use a position
+# instead of servo degrees: 0 = home (folded), 180 = fully extended (the other
+# end), spread evenly in between. Otherwise positions are plain servo degrees.
 LOWER_ARM_MIN = 0
 LOWER_ARM_MAX = 180
 LOWER_ARM_HOME = 90
 UPPER_ARM_MIN = 0
 UPPER_ARM_MAX = 180
 UPPER_ARM_HOME = 90
+
+# Which way each joint moves as its position goes up (extending it), as
+# found by arm-calibrate. For information only:
+#   LOWER_ARM_DIRECTION  1 = extending leans the lower arm forward
+#                       -1 = extending leans it back
+#   UPPER_ARM_DIRECTION  1 = extending lifts the claw
+#                       -1 = extending lowers the claw
+#   0 = not calibrated yet
+LOWER_ARM_DIRECTION = 0
+UPPER_ARM_DIRECTION = 0
 
 # Default joint speed, 1..100 (100 = jump straight to the angle).
 # The library moves about 4.6 deg per 10 ms at 100, so 20 is ~90 deg/s.
@@ -115,6 +142,14 @@ BASE_LIMIT_DEG = 90         # never turn further than this either side of centre
 TIMER_ID = 0
 TICK_MS = 10
 
+# Joint servo pulse, the same scale as the servo library (angle * 102/180 + 25
+# in 1/1024ths of 20 ms) but set in nanoseconds: the library's 10-bit duty
+# moves in 1.8 degree jumps, which makes slow moves jerky.
+SERVO_NS0 = 488281
+SERVO_NS_PER_DEG = 11068
+# Joint speed 1 is SERVO_DEG_S deg/s on average (the library's step rate).
+SERVO_DEG_S = 4.61
+
 # Remote control mapping: (channel index, direction). Channels in
 # rc_slave_data(): 0=L1 1=L2 2=L3 3=R1 4=R2 5=R3, 6..9 = K1..K4 buttons.
 # Use MODE = "rc_monitor" to see which channel each stick moves.
@@ -132,6 +167,70 @@ RC_JOINT_RATE = 90      # deg/s at full stick deflection
 RC_BASE_MAX = 60        # base speed (%) at full stick deflection
 RC_LOOP_MS = 20
 
+# Calibration saved on the board by claw-calibrate / base-calibrate /
+# arm-calibrate. Values in this file replace the defaults above when the
+# library starts.
+CAL_FILE = "/arm_cal.json"
+CAL_KEYS = ("CLAW_OPEN_MS", "CLAW_CLOSE_MS", "CLAW_OPEN_DIRECTION",
+            "BASE_RIGHT_MS", "BASE_LEFT_MS", "BASE_DIRECTION",
+            "LOWER_ARM_MIN", "LOWER_ARM_MAX", "LOWER_ARM_HOME", "LOWER_ARM_DIRECTION",
+            "UPPER_ARM_MIN", "UPPER_ARM_MAX", "UPPER_ARM_HOME", "UPPER_ARM_DIRECTION")
+JOINT_RANGE_MIN = 10    # calibrated limits must be at least this far apart
+
+
+# =============================================================================
+# Calibration file
+# =============================================================================
+
+def _calibration_ok(key, value):
+    if not isinstance(value, int) or isinstance(value, bool):
+        return False
+    if key.endswith("_DIRECTION"):
+        return value in (-1, 1)
+    if key[-4:] in ("_MIN", "_MAX") or key[-5:] == "_HOME":
+        return 0 <= value <= 180
+    return 100 <= value <= 60000
+
+
+def _joint_problem(values, joint):
+    """Why a joint's MIN / HOME / MAX do not fit together, or None."""
+    lo, home, hi = (values[joint + "_MIN"], values[joint + "_HOME"],
+                    values[joint + "_MAX"])
+    if not lo <= home <= hi:
+        return "%s: need MIN <= HOME <= MAX, got %d / %d / %d" % (joint, lo, home, hi)
+    if hi - lo < JOINT_RANGE_MIN:
+        return "%s: MIN and MAX must be at least %d degrees apart" % (joint, JOINT_RANGE_MIN)
+    return None
+
+
+def read_calibration():
+    """The values saved in CAL_FILE ({} if there are none)."""
+    try:
+        import json
+        with open(CAL_FILE) as f:
+            cal = json.load(f)
+    except (OSError, ValueError):
+        return {}
+    return cal if isinstance(cal, dict) else {}
+
+
+def _apply_calibration(cal):
+    # Bad values are skipped, so a damaged file can never stop the arm starting.
+    g = globals()
+    new = {key: g[key] for key in CAL_KEYS}
+    for key in CAL_KEYS:
+        value = cal.get(key)
+        if _calibration_ok(key, value):
+            new[key] = value
+    for joint in ("LOWER_ARM", "UPPER_ARM"):
+        if _joint_problem(new, joint):
+            for part in ("_MIN", "_HOME", "_MAX"):
+                new[joint + part] = g[joint + part]
+    g.update(new)
+
+
+_apply_calibration(read_calibration())
+
 
 # =============================================================================
 # Arm controller
@@ -148,14 +247,7 @@ class CyberBrickArm:
         self.servos = ServosController()
         self.motors = MotorsController()
 
-        self._limits = {
-            LOWER_ARM_SERVO: (LOWER_ARM_MIN, LOWER_ARM_MAX),
-            UPPER_ARM_SERVO: (UPPER_ARM_MIN, UPPER_ARM_MAX),
-        }
-        self._home = {
-            LOWER_ARM_SERVO: LOWER_ARM_HOME,
-            UPPER_ARM_SERVO: UPPER_ARM_HOME,
-        }
+        self.set_joint_limits(True)
 
         # Make sure nothing is spinning before we start.
         self.motors.stop(BASE_MOTOR)
@@ -194,8 +286,9 @@ class CyberBrickArm:
         self._running = True
 
         # Joints have no position feedback, so start by sending them home.
+        self._glide = {}
         for servo, angle in self._home.items():
-            self.servos.set_angle(servo, angle)
+            self._set_servo(servo, angle)
 
         self._timer = Timer(TIMER_ID)
         self._timer.init(period=TICK_MS, mode=Timer.PERIODIC,
@@ -207,6 +300,7 @@ class CyberBrickArm:
         try:
             self.servos.timing_proc()
             now = time.ticks_ms()
+            self._update_joints(now)
             self._update_claw(now)
             self._update_base(now)
         except Exception as e:
@@ -217,6 +311,33 @@ class CyberBrickArm:
             self._claw_applied = 0
             self._base_cmd = None
             self._base_applied = 0
+
+    def _write_servo(self, servo, angle):
+        self.servos.servos_info_map[servo - 1]["c_ang"] = angle
+        self.servos.servos_map[servo - 1].duty_ns(
+            int(SERVO_NS0 + angle * SERVO_NS_PER_DEG))
+
+    def _set_servo(self, servo, angle):
+        """Put a joint servo at `angle` now, stopping any glide."""
+        self._glide.pop(servo, None)
+        self.servos.set_angle(servo, angle)     # the library's bookkeeping
+        self._write_servo(servo, angle)
+
+    def _update_joints(self, now):
+        # Each glide eases in and out (smoothstep), so a joint speeds up and
+        # slows down gently instead of jolting at the start, end and turns.
+        for servo in (LOWER_ARM_SERVO, UPPER_ARM_SERVO):
+            g = self._glide.get(servo)
+            if g is None:
+                continue
+            start, target, t0, dur = g
+            t = time.ticks_diff(now, t0)
+            if t >= dur:
+                del self._glide[servo]
+                self._write_servo(servo, target)
+                continue
+            u = t / dur
+            self._write_servo(servo, start + (target - start) * u * u * (3 - 2 * u))
 
     def _update_claw(self, now):
         dt = time.ticks_diff(now, self._claw_last_ms)
@@ -309,41 +430,78 @@ class CyberBrickArm:
         if servo not in self._limits:
             raise ValueError("servo must be LOWER_ARM_SERVO (1) or UPPER_ARM_SERVO (2)")
 
-    def joint_angle(self, servo):
-        """Current commanded angle of a joint (degrees)."""
+    def _position_range(self, servo):
+        return (0, 180) if self._map[servo] else self._limits[servo]
+
+    def _to_servo(self, servo, position):
+        """Servo degrees for a joint position."""
+        m = self._map[servo]
+        if m is None:
+            return position
+        return m[0] + (m[1] - m[0]) * position / 180
+
+    def _to_position(self, servo, angle):
+        """Joint position for servo degrees."""
+        m = self._map[servo]
+        if m is None:
+            return angle
+        return (angle - m[0]) * 180 / (m[1] - m[0])
+
+    def servo_angle(self, servo):
+        """Current commanded angle of a joint's servo (degrees)."""
         self._check_joint(servo)
         return self.servos.servos_info_map[servo - 1]["c_ang"]
 
+    def joint_angle(self, servo):
+        """Current position of a joint: 0 (home) .. 180 (fully extended) once
+        calibrated, plain servo degrees before."""
+        angle = self.servo_angle(servo)
+        want = self._want.get(servo)
+        # The servo is driven in whole degrees; report the position that was
+        # asked for once it is there, not the rounded one.
+        if want is not None and abs(self._to_servo(servo, want) - angle) <= 0.5:
+            return want
+        return self._to_position(servo, angle)
+
     def joint_target(self, servo):
-        """Angle the joint is moving towards (degrees)."""
+        """Position the joint is moving towards."""
         self._check_joint(servo)
-        return self.servos.servos_info_map[servo - 1]["s_ang"]
+        return self._to_position(servo, self.servos.servos_info_map[servo - 1]["s_ang"])
+
+    def home_position(self, servo):
+        """The joint's home as a position (0 once calibrated)."""
+        self._check_joint(servo)
+        return 0 if self._map[servo] else self._home[servo]
 
     def move_joint(self, servo, angle, speed=JOINT_SPEED, wait=True):
-        """Move a joint to `angle` (clamped to its limits).
+        """Move a joint to a position (`angle`), kept within its limits:
+        0 (home) .. 180 (fully extended) once calibrated, else servo degrees.
 
-        speed: 1..100, where 100 jumps straight to the angle.
+        speed: 1..100, where 100 jumps straight there.
         """
         self._check_joint(servo)
-        lo, hi = self._limits[servo]
-        # Whole degrees keep the servo library's 10 ms update on integers
-        # once the joint has arrived.
-        angle = int(_clamp(angle, lo, hi) + 0.5)
+        lo, hi = self._position_range(servo)
+        position = _clamp(angle, lo, hi)
+        self._want[servo] = position
+        target = int(self._to_servo(servo, position) + 0.5)
         speed = int(_clamp(speed, 1, 100))
-        if speed >= 100:
-            self.servos.set_angle(servo, angle)
+        start = self.servo_angle(servo)
+        dur = int(abs(target - start) * 1000 / (speed * SERVO_DEG_S))
+        if speed >= 100 or dur < TICK_MS:
+            self._set_servo(servo, target)
         else:
-            self.servos.set_angle_step(servo, speed)
-            self.servos.set_angle_stepping(servo, angle)
+            self.servos.servos_info_map[servo - 1]["s_ang"] = target
+            self._glide[servo] = (start, target, time.ticks_ms(), dur)
         if wait:
             self.wait_joints()
 
     def jog_joint(self, servo, delta):
-        """Nudge a joint by `delta` degrees immediately (used for live control)."""
+        """Nudge a joint by `delta` (position units) at once (live control)."""
         self._check_joint(servo)
-        lo, hi = self._limits[servo]
-        angle = _clamp(self.joint_angle(servo) + delta, lo, hi)
-        self.servos.set_angle(servo, angle)
+        lo, hi = self._position_range(servo)
+        position = _clamp(self.joint_angle(servo) + delta, lo, hi)
+        self._want[servo] = position
+        self._set_servo(servo, self._to_servo(servo, position))
 
     def move_lower_arm(self, angle, speed=JOINT_SPEED, wait=True):
         """Move the lower arm (S1)."""
@@ -363,11 +521,7 @@ class CyberBrickArm:
             self.wait_joints()
 
     def joints_moving(self):
-        for servo in self._limits:
-            info = self.servos.servos_info_map[servo - 1]
-            if info["step_en"] and abs(info["s_ang"] - info["c_ang"]) > 0.01:
-                return True
-        return False
+        return bool(self._glide)
 
     def wait_joints(self, timeout_ms=15000):
         """Block until both joints reach their targets. Returns False on timeout."""
@@ -381,11 +535,13 @@ class CyberBrickArm:
     def hold_joints(self):
         """Stop any joint movement in progress and hold the current angles."""
         for servo in self._limits:
-            self.servos.set_angle(servo, self.joint_angle(servo))
+            self._set_servo(servo, self.servo_angle(servo))
+            self._want.pop(servo, None)
 
     def release_joints(self):
         """Cut the signal to S1/S2 so the joints go limp (the arm may drop)."""
         for servo in self._limits:
+            self._glide.pop(servo, None)
             self.servos.stop(servo)
 
     # ------------------------------------------------------------------- claw
@@ -501,6 +657,28 @@ class CyberBrickArm:
     def base_moving(self):
         return self._base_cmd is not None or self._base_applied != 0
 
+    def set_joint_limits(self, enabled=True):
+        """Use the calibrated joint settings, or (enabled=False, only for
+        calibration) drive the servos in plain degrees over their whole
+        0..180 range."""
+        g = globals()
+        self._limits, self._map, self._home, self._want = {}, {}, {}, {}
+        for servo, joint in ((LOWER_ARM_SERVO, "LOWER_ARM"), (UPPER_ARM_SERVO, "UPPER_ARM")):
+            lo, hi, home = g[joint + "_MIN"], g[joint + "_MAX"], g[joint + "_HOME"]
+            self._home[servo] = home                     # servo degrees
+            if not enabled:
+                self._limits[servo], self._map[servo] = (0, 180), None
+                continue
+            self._limits[servo] = (lo, hi)
+            # (home, fully extended) in servo degrees when home is at one end;
+            # positions then run 0 (home) .. 180 (extended).
+            self._map[servo] = ((home, hi) if home == lo else
+                                (home, lo) if home == hi else None)
+
+    def set_base_limit(self, enabled=True):
+        """Turn the +-BASE_LIMIT_DEG stop off (only for calibration) or back on."""
+        self._base_lim = (BASE_RIGHT_MS * BASE_LIMIT_DEG // 90) if enabled else 1 << 28
+
     def wait_base(self, timeout_ms=None):
         """Block until a base turn finishes. Returns False on timeout."""
         if timeout_ms is None:
@@ -517,7 +695,8 @@ class CyberBrickArm:
 
     def home(self, speed=JOINT_SPEED, wait=True):
         """Move both joints to the home pose and turn the base to centre."""
-        self.move_arm(LOWER_ARM_HOME, UPPER_ARM_HOME, speed, wait=False)
+        self.move_arm(self.home_position(LOWER_ARM_SERVO),
+                      self.home_position(UPPER_ARM_SERVO), speed, wait=False)
         self.turn_base(0, wait=False)
         if wait:
             self.wait_joints()
@@ -540,6 +719,51 @@ class CyberBrickArm:
         if self.timer_error is not None:
             s["timer_error"] = repr(self.timer_error)
         return s
+
+    def calibration(self, keys=None):
+        """The calibration values in use: {name: value} for `keys` (default
+        CAL_KEYS). Over the radio, ask for a few keys at a time so the reply
+        fits in one message."""
+        g = globals()
+        return {key: g[key] for key in (keys or CAL_KEYS) if key in CAL_KEYS}
+
+    def save_calibration(self, values):
+        """Save calibration values in CAL_FILE on the board and use them now.
+
+        values: {name: int} for names in CAL_KEYS. The base angle and claw
+        opening estimates are kept.
+        """
+        cal = read_calibration()
+        for key, value in values.items():
+            value = int(value)
+            if key not in CAL_KEYS or not _calibration_ok(key, value):
+                raise ValueError("bad calibration value %s=%r" % (key, value))
+            cal[key] = value
+        g = globals()
+        merged = {key: cal.get(key, g[key]) for key in CAL_KEYS}
+        for joint in ("LOWER_ARM", "UPPER_ARM"):
+            problem = _joint_problem(merged, joint)
+            if problem:
+                raise ValueError(problem)
+        import json
+        import os
+        base, claw = self.base_angle(), self.claw_position()
+        tmp = CAL_FILE + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump(cal, f)
+        try:
+            os.remove(CAL_FILE)
+        except OSError:
+            pass
+        os.rename(tmp, CAL_FILE)
+        _apply_calibration(cal)
+        # Positions are kept in milliseconds of travel, so re-express them in
+        # the new timings.
+        self.set_base_limit(True)
+        self.set_joint_limits(True)
+        self.set_base_angle(base)
+        self.calibrate_claw(claw)
+        return self.calibration(list(values))
 
     def shutdown(self, release=False):
         """Stop the timer, base and claw. Joints keep holding unless release=True."""
@@ -565,6 +789,8 @@ class CyberBrickArm:
 
 def demo(arm):
     """Exercise every joint, the claw and the base, then pick and place."""
+    lo = arm.home_position(LOWER_ARM_SERVO)
+    up = arm.home_position(UPPER_ARM_SERVO)
     print("[demo] home")
     arm.home()
     time.sleep_ms(500)
@@ -576,14 +802,14 @@ def demo(arm):
     time.sleep_ms(300)
 
     print("[demo] lower arm (S1) sweep")
-    arm.move_lower_arm(LOWER_ARM_HOME + 30)
-    arm.move_lower_arm(LOWER_ARM_HOME - 30)
-    arm.move_lower_arm(LOWER_ARM_HOME)
+    arm.move_lower_arm(lo + 30)
+    arm.move_lower_arm(lo - 30)
+    arm.move_lower_arm(lo)
 
     print("[demo] upper arm (S2) sweep")
-    arm.move_upper_arm(UPPER_ARM_HOME + 30)
-    arm.move_upper_arm(UPPER_ARM_HOME - 30)
-    arm.move_upper_arm(UPPER_ARM_HOME)
+    arm.move_upper_arm(up + 30)
+    arm.move_upper_arm(up - 30)
+    arm.move_upper_arm(up)
 
     print("[demo] base (M2) left / right")
     arm.turn_base(45)
@@ -594,14 +820,14 @@ def demo(arm):
 
     print("[demo] pick and place")
     arm.open_claw()
-    arm.move_arm(lower=LOWER_ARM_HOME + 35, upper=UPPER_ARM_HOME - 25)   # reach
-    arm.close_claw()                                                     # grab
-    arm.move_arm(lower=LOWER_ARM_HOME, upper=UPPER_ARM_HOME)             # lift
-    arm.turn_base(60)                                                    # turn
-    arm.move_arm(lower=LOWER_ARM_HOME + 35, upper=UPPER_ARM_HOME - 25)   # lower
-    arm.open_claw()                                                      # drop
-    arm.move_arm(lower=LOWER_ARM_HOME, upper=UPPER_ARM_HOME)             # lift
-    arm.turn_base(0)                                                     # turn back
+    arm.move_arm(lower=lo + 35, upper=up - 25)   # reach
+    arm.close_claw()                             # grab
+    arm.move_arm(lower=lo, upper=up)             # lift
+    arm.turn_base(60)                            # turn
+    arm.move_arm(lower=lo + 35, upper=up - 25)   # lower
+    arm.open_claw()                              # drop
+    arm.move_arm(lower=lo, upper=up)             # lift
+    arm.turn_base(0)                             # turn back
     arm.close_claw()
 
     print("[demo] done:", arm.status())
