@@ -14,8 +14,8 @@ waits until the movement has finished, then returns the arm's new state.
 | Part      | What it does                                      | Range                                    |
 | --------- | ------------------------------------------------- | ---------------------------------------- |
 | Base      | Turns the whole arm left/right (DC motor)         | -90 (full left) .. 0 (centre) .. 90 (full right) |
-| Lower arm | Shoulder joint, servo S1                          | 0-180 degrees, 90 = home                 |
-| Upper arm | Elbow joint, servo S2                             | 0-180 degrees, 90 = home                 |
+| Lower arm | Shoulder joint, servo S1                          | position 0 = home (folded) .. 180 = fully extended |
+| Upper arm | Elbow joint, servo S2                             | position 0 = home (folded) .. 180 = fully extended |
 | Claw      | Gripper                                           | 0 = closed .. 1 = fully open             |
 
 Left and right are as seen from **behind** the arm, looking the way it faces at centre.
@@ -27,11 +27,12 @@ Left and right are as seen from **behind** the arm, looking the way it faces at 
 | `cyberbrick_arm_status`      | Check where everything is. Nothing moves.                   |
 | `cyberbrick_arm_rotate_base` | Turn/spin `left` or `right` by 1-90 degrees from where it is |
 | `cyberbrick_arm_face_angle`  | Point the base at an exact angle, -90..90 (0 = straight ahead) |
-| `cyberbrick_arm_move`        | Move `lower` and/or `upper` joint to an angle (optional `speed` 1-100) |
+| `cyberbrick_arm_move`        | Move `lower` and/or `upper` joint to a position 0-180 (optional `speed` 1-100) |
 | `cyberbrick_arm_open_claw`   | Open the claw fully                                         |
 | `cyberbrick_arm_close_claw`  | Close the claw fully                                        |
 | `cyberbrick_arm_set_claw`    | Open the claw part way (`position` 0-1)                     |
-| `cyberbrick_arm_home`        | Joints to 90/90 and base to centre (claw unchanged)          |
+| `cyberbrick_arm_gesture`     | `wave`, `nod` or `shake` in one smooth call, then back to the start pose (optional `times`, `speed`) |
+| `cyberbrick_arm_home`        | Joints to position 0 (home, folded) and base to centre (claw unchanged) |
 | `cyberbrick_arm_stop`        | Stop base and claw now, hold joints where they are          |
 
 ## Base rotation rule (hard limit)
@@ -62,17 +63,24 @@ whole working range: a half circle in front of the arm. Full spins are not possi
 5. If the user says "stop", "wait" or anything urgent, call `cyberbrick_arm_stop`
    immediately before anything else.
 
-## Joint directions
+## Joint positions and directions
 
-Which way a joint moves when its angle goes up depends on how the servo is mounted, so
-it is not built in. If the notes below are filled in, use them. Otherwise, the first time
-you need a direction (e.g. "reach forward", "lift up"), make a small test move (15
-degrees from the current angle), ask the user which way it went, and remember the answer
-for the rest of the conversation.
+Each joint is driven by a **position from 0 to 180**: 0 = home (folded, at rest), 180 =
+fully extended, 90 = half way. These are not degrees: the arm turns them into the right
+servo angle for each joint, and it can never be driven past folded or fully extended.
+`cyberbrick_arm_home` folds both joints back to 0.
 
-<!-- Fill these in for your arm, e.g. "Lower arm: higher angle leans forward". -->
-- Lower arm: higher angle = (unknown)
-- Upper arm: higher angle = (unknown)
+`cyberbrick_arm_status` also says which way extending each joint moves the arm, for
+example: "Lower arm: position 0 = home (folded), 180 = fully extended; extending leans it
+forward. Upper arm: ...; extending lifts the claw." These come from the user's
+`arm-calibrate` run.
+
+- "Reach out" or "stretch" means higher positions; "pull in" or "fold up" means lower.
+- For "lift" or "lower", use the direction the status gives.
+- If the status says a joint is not calibrated, its position is a raw servo angle and
+  the direction is unknown. Make a small test move (15 from the current position) the
+  first time you need it, and ask the user which way it went. Suggest they run
+  `arm_serial.py arm-calibrate` (the `cyberbrick-arm-setup` skill).
 
 ## Limits of what the arm knows
 

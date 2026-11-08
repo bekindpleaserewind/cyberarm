@@ -1,9 +1,10 @@
 /**
  * OpenClaw plugin for the CyberBrick robotic arm.
  *
- * Every tool runs the PC driver (src/arm_serial.py) with --json, which talks
- * to the arm's receiver board over USB serial and prints one JSON result.
- * Commands are queued so only one uses the serial port at a time.
+ * Every tool runs the PC driver (src/arm_serial.py) with --json, which sends
+ * the command to the arm and prints one JSON result. Once radio mode is set up
+ * it goes PC --USB--> CyberBrick remote --radio--> arm; otherwise over the
+ * arm's own USB. Commands are queued so only one uses the link at a time.
  *
  * Safety: the base never turns more than 90 degrees left or right of centre.
  * The tools refuse larger angles, and the board library enforces the same
@@ -30,6 +31,10 @@ type ArmStatus = {
   timer_error?: string;
 };
 
+// Joint calibration from `arm_serial.py arm-calibrate` (LOWER_ARM_MIN,
+// LOWER_ARM_DIRECTION, ...). The driver adds it to the status command's result.
+type Calibration = Record<string, number>;
+
 type DriverResult = {
   ok: boolean;
   command: string;
@@ -37,12 +42,14 @@ type DriverResult = {
   status: ArmStatus | null;
   output: string;
   error: string | null;
+  calibration?: Calibration;
 };
 
 type Settings = {
   python: string;
   driverPath: string;
   port?: string;
+  transport?: "auto" | "radio" | "usb";
   timeoutMs: number;
 };
 
@@ -74,10 +81,17 @@ function resolveSettings(config: Record<string, unknown>, rootDir?: string): Set
     (existsSync(venvPython) ? venvPython : process.platform === "win32" ? "python" : "python3");
 
   const timeout = typeof config.timeoutSeconds === "number" ? config.timeoutSeconds : 90;
-  return { python, driverPath, port: str("port"), timeoutMs: Math.round(timeout * 1000) };
+  const transport = str("transport");
+  return {
+    python,
+    driverPath,
+    port: str("port"),
+    transport: transport === "radio" || transport === "usb" || transport === "auto" ? transport : undefined,
+    timeoutMs: Math.round(timeout * 1000),
+  };
 }
 
-// One serial port, one command at a time.
+// One link to the arm, one command at a time.
 let queue: Promise<unknown> = Promise.resolve();
 
 function runDriver(settings: Settings, args: string[]): Promise<DriverResult> {
@@ -95,6 +109,7 @@ function runDriver(settings: Settings, args: string[]): Promise<DriverResult> {
         }
         const argv = [settings.driverPath, "--json"];
         if (settings.port) argv.push("--port", settings.port);
+        if (settings.transport) argv.push("--transport", settings.transport);
         argv.push(...args);
         execFile(
           settings.python,
@@ -140,9 +155,32 @@ function describe(status: ArmStatus): string {
   let text =
     `Base faces ${describeBase(status.base_angle)} (base_angle ${Math.round(status.base_angle)}, ` +
     `limit ±${BASE_LIMIT}). Claw ${clawText} (${status.claw}). ` +
-    `Lower arm ${status.lower_arm}°, upper arm ${status.upper_arm}°.`;
+    `Lower arm at position ${status.lower_arm}, upper arm at ${status.upper_arm} (0 = home, 180 = fully extended).`;
   if (status.timer_error) text += ` WARNING: board timer error ${status.timer_error}.`;
   return text;
+}
+
+function describeJoints(cal: Calibration): string {
+  const joint = (key: string, name: string, plus: string, minus: string) => {
+    const lo = cal[`${key}_MIN`];
+    const hi = cal[`${key}_MAX`];
+    const home = cal[`${key}_HOME`];
+    if (home !== lo && home !== hi) {
+      return (
+        `${name}: not calibrated yet, so its position is the raw servo angle ${lo}-${hi} ` +
+        `(home ${home}) and which way it moves is unknown`
+      );
+    }
+    const d = cal[`${key}_DIRECTION`];
+    const way = d === 1 ? plus : d === -1 ? minus : "moves it an unknown way";
+    return `${name}: position 0 = home (folded), 180 = fully extended; extending ${way}`;
+  };
+  return (
+    joint("LOWER_ARM", "Lower arm", "leans it forward", "leans it back") +
+    ". " +
+    joint("UPPER_ARM", "Upper arm", "lifts the claw", "lowers the claw") +
+    "."
+  );
 }
 
 async function armCommand(settings: Settings, args: string[], summary?: (r: DriverResult) => string) {
@@ -150,9 +188,10 @@ async function armCommand(settings: Settings, args: string[], summary?: (r: Driv
   if (!result.ok || !result.status) {
     throw new Error(`Arm command '${args.join(" ")}' failed: ${result.error ?? "unknown error"}`);
   }
-  const lead = summary ? summary(result) + " " : "";
+  const parts = [summary ? summary(result) : "", describe(result.status)];
+  if (result.calibration) parts.push(describeJoints(result.calibration));
   return {
-    content: [{ type: "text" as const, text: lead + describe(result.status) }],
+    content: [{ type: "text" as const, text: parts.filter(Boolean).join(" ") }],
     details: result,
   };
 }
@@ -186,16 +225,45 @@ const clawParams = Type.Object({
 
 const moveParams = Type.Object({
   lower: Type.Optional(
-    Type.Number({ minimum: JOINT_MIN, maximum: JOINT_MAX, description: "Lower arm angle, 0-180." }),
+    Type.Number({
+      minimum: JOINT_MIN,
+      maximum: JOINT_MAX,
+      description: "Lower arm position: 0 = home (folded) .. 180 = fully extended.",
+    }),
   ),
   upper: Type.Optional(
-    Type.Number({ minimum: JOINT_MIN, maximum: JOINT_MAX, description: "Upper arm angle, 0-180." }),
+    Type.Number({
+      minimum: JOINT_MIN,
+      maximum: JOINT_MAX,
+      description: "Upper arm position: 0 = home (folded) .. 180 = fully extended.",
+    }),
   ),
   speed: Type.Optional(
     Type.Number({
       minimum: 1,
       maximum: 100,
       description: "1 (slow) to 100 (instant). Default 20, about 90°/s.",
+    }),
+  ),
+});
+
+// Default swings per gesture (GESTURES in arm_serial.py).
+const GESTURE_TIMES: Record<string, number> = { wave: 3, nod: 2, shake: 2 };
+
+const gestureParams = Type.Object({
+  gesture: Type.Unsafe<"wave" | "nod" | "shake">({
+    type: "string",
+    enum: ["wave", "nod", "shake"],
+    description: "wave = hello/goodbye, nod = yes, shake = no.",
+  }),
+  times: Type.Optional(
+    Type.Integer({ minimum: 1, maximum: 10, description: "Swings. Default: wave 3, nod 2, shake 2." }),
+  ),
+  speed: Type.Optional(
+    Type.Number({
+      minimum: 1,
+      maximum: 100,
+      description: "Joint speed 1-100. Default 25 (smooth). Not used by shake.",
     }),
   ),
 });
@@ -216,7 +284,8 @@ export default definePluginEntry({
       label: "Arm status",
       description:
         "Read the CyberBrick arm's current state: base angle (-90 left .. 0 centre .. 90 right), " +
-        "lower/upper arm joint angles (0-180, 90 = home) and claw opening (0 closed .. 1 open). " +
+        "lower/upper arm joint positions (0 = home/folded .. 180 = fully extended) and claw opening " +
+        "(0 closed .. 1 open), plus which way extending each joint moves it (from arm calibration). " +
         "Nothing moves. Base angle and claw are estimates from timing.",
       parameters: noParams,
       async execute() {
@@ -310,8 +379,9 @@ export default definePluginEntry({
       name: "cyberbrick_arm_move",
       label: "Move arm joints",
       description:
-        "Move the arm: lower arm joint (S1) and/or upper arm joint (S2) to absolute angles 0-180 " +
-        "(90 = home pose). Give one or both. Both move together and the tool returns when they arrive.",
+        "Move the arm: lower arm joint (S1) and/or upper arm joint (S2) to a position from 0 " +
+        "(home, folded) to 180 (fully extended); 90 is half way. Give one or both. Both move " +
+        "together and the tool returns when they arrive.",
       parameters: moveParams,
       async execute(_id, raw) {
         const params = typed(moveParams, raw);
@@ -339,14 +409,56 @@ export default definePluginEntry({
           }
           args.push(String(speed));
         }
-        return armCommand(settings(), args);
+        return armCommand(settings(), args, (r) => {
+          const notes: string[] = [];
+          const check = (asked: number | undefined, got: number | undefined, name: string) => {
+            if (asked !== undefined && got !== undefined && Math.abs(got - asked) > 1) {
+              notes.push(`the ${name} stopped at ${got} (its limit), not ${asked}`);
+            }
+          };
+          check(lower, r.status?.lower_arm, "lower arm");
+          check(upper, r.status?.upper_arm, "upper arm");
+          return notes.length ? `Note: ${notes.join("; ")}.` : "";
+        });
+      },
+    });
+
+    api.registerTool({
+      name: "cyberbrick_arm_gesture",
+      label: "Arm gesture",
+      description:
+        "Make a gesture in one smooth motion: wave (swing the upper arm), nod (yes, with the " +
+        "lower arm) or shake (no, turning the base). The arm raises itself first if needed, " +
+        "swings at one even speed, and returns to the pose it started in. Use this rather " +
+        "than a series of cyberbrick_arm_move calls, which jerk and pause between swings.",
+      parameters: gestureParams,
+      async execute(_id, raw) {
+        const params = typed(gestureParams, raw);
+        const name = String(params.gesture ?? "");
+        if (!["wave", "nod", "shake"].includes(name)) {
+          throw new Error("gesture must be wave, nod or shake");
+        }
+        const args = ["gesture", name];
+        const times = params.times === undefined ? undefined : Number(params.times);
+        const speed = params.speed === undefined ? undefined : Number(params.speed);
+        if (times !== undefined && !(Number.isInteger(times) && times >= 1 && times <= 10)) {
+          throw new Error("times must be a whole number from 1 to 10");
+        }
+        if (speed !== undefined && !(Number.isFinite(speed) && speed >= 1 && speed <= 100)) {
+          throw new Error("speed must be between 1 and 100");
+        }
+        if (times !== undefined || speed !== undefined) args.push(String(times ?? GESTURE_TIMES[name]));
+        if (speed !== undefined) args.push(String(speed));
+        return armCommand(settings(), args, () => `Done: ${name}.`);
       },
     });
 
     api.registerTool({
       name: "cyberbrick_arm_home",
       label: "Arm home",
-      description: "Return the arm to its home pose: both joints to 90° and the base to centre. The claw is unchanged.",
+      description:
+        "Return the arm to its home pose: both joints to position 0 (home, folded) and the base " +
+        "to centre. The claw is unchanged.",
       parameters: noParams,
       async execute() {
         return armCommand(settings(), ["home"]);
