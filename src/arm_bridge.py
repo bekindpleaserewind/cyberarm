@@ -12,6 +12,9 @@ import json
 import os
 import time
 
+NO_REPLY_MS = 5000      # keep resending this long before giving up: rides out
+                        # bursts of interference on the radio channel
+
 
 class Bridge:
     def __init__(self, peer, pmk, lmk, channel):
@@ -60,16 +63,14 @@ class Bridge:
         msg = "[%d, %s" % (seq, body)
         start = time.ticks_ms()
         sent = heard = None
-        tries = 0
         while True:
             now = time.ticks_ms()
             # Until the arm answers, resend quickly. After that, check in now
             # and then so a lost final reply is sent again.
             gap = 300 if heard is None else 1500
             if sent is None or time.ticks_diff(now, sent) >= gap:
-                if heard is None and tries >= 6:
+                if heard is None and time.ticks_diff(now, start) >= NO_REPLY_MS:
                     raise OSError("no reply from the arm")
-                tries += 1
                 try:
                     self.e.send(self.peer, msg, True)
                 except OSError:

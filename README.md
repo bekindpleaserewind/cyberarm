@@ -169,10 +169,15 @@ the arm, so they survive restarts and updates.
 
 ```bash
 python arm_serial.py arm-calibrate     # required: each joint's home and fully extended position
-python arm_serial.py base-calibrate    # required: times 90° base turns (the defaults are placeholders)
+python arm_serial.py base-tune         # required: sets 90° base turns (the defaults are placeholders)
 python arm_serial.py claw-calibrate    # recommended: times a full claw open and close
 python arm_serial.py calibration       # show what the arm is using
 ```
+
+`base-tune` needs no stopwatch: the arm times each turn itself and you say how far the
+base went (for example `70`), until a turn is exactly 90°. Mark straight ahead and 90°
+on the table first. (`base-calibrate` is the older way: you press Enter when the base
+reaches 90°, so your reaction time ends up in the result.)
 
 `arm-calibrate` moves the joints from the keyboard (`+`, `-`, `+20`, or a servo angle),
 not by hand: while the battery is on, the servos hold their position firmly.
@@ -285,7 +290,8 @@ them all. Joint positions run from 0 (home, folded) to 180 (fully extended). `SP
 | ------- | ---- |
 | `arm-calibrate` | Set each joint's home and fully extended position, and which way it moves |
 | `arm-align` | Re-seat a joint on its servo so home is at the servo's end, then calibrate |
-| `base-calibrate` | Time 90° base turns and check which way is right |
+| `base-tune` | Set 90° base turns: the arm times each turn, you say how far it went; also checks which way is right |
+| `base-calibrate` | Older way: time 90° base turns by pressing Enter |
 | `claw-calibrate` | Time a full claw open and close |
 | `calibration` | Show every calibration value the arm uses |
 
@@ -295,7 +301,7 @@ them all. Joint positions run from 0 (home, folded) to 180 (fully extended). `SP
 | ------- | ---- |
 | `radio-pair [CHANNEL]` | USB in the remote: make the link keys and set the remote up as the radio bridge |
 | `radio-install` | USB in the arm, once: install radio mode and reboot into it (safe to run again) |
-| `ping` | Check the link: reply time, signal strength, the arm's free RAM |
+| `ping` | Check the link: reply time, signal strength, free RAM, why the arm last restarted |
 | `update [--force]` | Send changed `cyberbrick_arm.py` / `arm_radio.py` to the arm over the radio |
 | `remote` | Hand the arm to the stick remote until it is switched off and on |
 

@@ -41,6 +41,7 @@ import machine
 RADIO_FILE = "/arm_radio.json"   # {"peer", "pmk", "lmk", "channel"}
 MODE_FILE = "/arm_mode"          # read by the boot hook
 MAX_MSG = 250                    # ESP-NOW payload limit
+STATUS_MAX = MAX_MSG - 16        # room for the status in [seq, "D", status]
 FREE_RUN_MAX_MS = 20000          # free spins stop by themselves after this
 
 # Parts of the arm, as bit flags.
@@ -164,10 +165,15 @@ class Radio:
 class Server:
     """Runs radio requests on the arm, one at a time."""
 
-    def __init__(self, arm, radio, boot_id):
+    def __init__(self, arm, radio, boot_id, lib="cyberbrick_arm", rst=None):
         self.arm = arm
         self.radio = radio
         self.boot = boot_id
+        self.rst = rst         # machine.reset_cause() at boot: why it restarted
+        # Which files are running, only when they are the backup copies:
+        # e.g. "radio+arm_old".
+        self.code = (None if (__name__, lib) == ("arm_radio", "cyberbrick_arm")
+                     else __name__[4:] + "+" + lib[11:])
         self.seq = None        # seq of the request running or last run
         self.reply = None      # its final reply, once there is one
         self.wait = 0          # parts the running request waits for
@@ -183,8 +189,21 @@ class Server:
         s = self.arm.status()
         s["boot"] = self.boot
         s["mem"] = gc.mem_free()
+        if self.rst is not None:
+            s["rst"] = self.rst
+        if self.code:
+            s["code"] = self.code
         if self.error is not None:
             s["radio_error"] = self.error
+        # The status must fit in one message: shorten the error texts, and
+        # if it still does not fit, leave out the extras.
+        for key in ("radio_error", "timer_error"):
+            if key in s:
+                s[key] = s[key][:40]
+        for key in ("radio_error", "timer_error", "code"):
+            if len(json.dumps(s)) <= STATUS_MAX:
+                break
+            s.pop(key, None)
         return s
 
     def finish(self, reply):
@@ -381,7 +400,11 @@ def run(lib="cyberbrick_arm", on_ready=None):
     gc.collect()
     arm = __import__(lib).CyberBrickArm()
     gc.collect()
-    server = Server(arm, radio, int.from_bytes(os.urandom(2), "big"))
+    try:
+        rst = machine.reset_cause()
+    except Exception:
+        rst = None
+    server = Server(arm, radio, int.from_bytes(os.urandom(2), "big"), lib, rst)
     if on_ready:
         on_ready()
     _led((0, 0, 24))           # dim blue: listening for the radio

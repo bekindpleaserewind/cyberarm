@@ -13,8 +13,9 @@ On the arm (receiver):
     remote-control firmware, for that one boot;
   * if radio mode fails to start: first the copies kept from before the last
     update, then the stock firmware. COUNT_FILE counts the attempts so a
-    crash that reboots the board moves on to the next one. The next power
-    cycle tries radio mode again.
+    crash that reboots the board moves on to the next one. Switching the
+    board off and on always starts again with radio mode, so turning it off
+    while it is still starting up is not mistaken for a crash.
 
 On the remote (transmitter):
   * MODE_FILE says "bridge": do nothing and wait at the REPL for the PC
@@ -79,11 +80,20 @@ def _ready():
     _remove(COUNT_FILE)
 
 
+def _power_on():
+    try:
+        return machine.reset_cause() == machine.PWRON_RESET
+    except Exception:
+        return False
+
+
 def _receiver():
     try:
         start = int(_read(COUNT_FILE) or 0)
     except ValueError:
         start = 0
+    if start and _power_on():
+        start = 0       # switched off and on, not a crash: radio mode first
     for i in range(start, len(TRIES)):
         _write(COUNT_FILE, str(i + 1))
         radio, lib = TRIES[i]

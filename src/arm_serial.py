@@ -1086,6 +1086,10 @@ class RadioSession:
         status = self.ping()
         self._restore_state(status)
         print("Arm ready:", _public(self.last_status))
+        if status.get("code"):
+            print(f"Warning: the arm is running backup copies ({status['code']}) "
+                  "because radio mode did not start with the current files.\n"
+                  "Switch the arm off and on; if this stays, run 'update --force'.")
 
     def arm_loaded(self):
         return True
@@ -1222,16 +1226,29 @@ class RadioSession:
               f"signal {rssi} dBm.")
         print(f"Arm free RAM: {status.get('mem', 0) // 1024} KB, boot id "
               f"{status.get('boot')}, versions {versions}.")
+        print("Last restart:", RESET_CAUSES.get(status.get("rst"), "unknown"))
         if status.get("radio_error"):
             print("Last radio error on the arm:", status["radio_error"])
+        if status.get("timer_error"):
+            print("Timer error on the arm:", status["timer_error"])
         print("Status:", _public(status))
+
+
+# machine.reset_cause() on the ESP32-C3, as reported by the arm.
+RESET_CAUSES = {
+    1: "switched on (or the battery voltage dipped)",
+    2: "restarted by a command or an update, or the code crashed",
+    3: "watchdog: the arm froze and restarted itself",
+    5: "soft reset",
+}
 
 
 def _public(status):
     """status() without the radio-only fields, same shape as over USB."""
     if not status:
         return status
-    return {k: v for k, v in status.items() if k not in ("boot", "mem", "radio_error")}
+    return {k: v for k, v in status.items()
+            if k not in ("boot", "mem", "radio_error", "rst", "code")}
 
 
 def radio_pair(link, pair, channel=None):
@@ -1448,6 +1465,7 @@ SESSION_COMMANDS = {
     "uninstall": "uninstall                    remove it and radio mode from the board (USB)",
     "claw-calibrate": "claw-calibrate               time a full claw open and close and save them",
     "base-calibrate": "base-calibrate               time 90 deg base turns and save them",
+    "base-tune": "base-tune                    set 90 deg base turns by how far timed turns go",
     "arm-calibrate": "arm-calibrate                set each joint's home and fully extended position",
     "arm-align": "arm-align                    re-seat a joint on its servo so it can use the full 0-180",
     "gesture":   "gesture wave|nod|shake [TIMES] [SPEED]  smooth gesture, then back to the start pose",
@@ -1524,6 +1542,22 @@ def calibrate_claw(session):
     print("The claw is closed and the arm knows it.")
 
 
+def _end_base_calibration(session):
+    """Stop the base and put its 90 degree limit back on after a base
+    calibration ends early: Ctrl-C (perhaps in the middle of a radio call,
+    which leaves the remote busy) or a lost link. Never raises."""
+    try:
+        session.link.interrupt()
+    except Exception:
+        pass
+    try:
+        session.call("base_stop", timeout=5)
+        session.call("set_base_limit", True, timeout=5)
+    except Exception as e:
+        print(f"Could not put the base's 90 deg limit back on ({e}).\n"
+              "Switch the arm off and on before using the base.")
+
+
 def calibrate_base(session):
     """Time 90 degree base turns and save BASE_RIGHT_MS / BASE_LEFT_MS.
 
@@ -1542,16 +1576,9 @@ def calibrate_base(session):
 
     session.call("set_base_limit", False, timeout=5)   # no limit while calibrating
     print("Base calibration. Watch the arm and press Enter at each step.")
+    finished = False
     try:
-        while True:
-            key = input("1) Nudge the base until the arm faces straight ahead:\n"
-                        "   type l or r then Enter to nudge, or just Enter when "
-                        "centred: ").strip().lower()
-            if not key:
-                break
-            if key[0] in "lr":
-                sign = -1 if key[0] == "l" else 1
-                session.call("rotate_base", sign * speed, 250, timeout=10)
+        _nudge_base(session, speed, "1) Nudge the base until the arm faces straight ahead:\n")
 
         _wait_enter("2) Press Enter to start turning (this is timed)...")
         spin(1)
@@ -1573,10 +1600,13 @@ def calibrate_base(session):
         t1 = _wait_enter("   Press Enter the moment it faces straight ahead again.")
         stop()
         back_ms = int((t1 - t0) * 1000)
+        finished = True
     except (KeyboardInterrupt, EOFError):
-        stop()
-        session.call("set_base_limit", True, timeout=5)
         print("\nCalibration cancelled; nothing saved.")
+    finally:
+        if not finished:
+            _end_base_calibration(session)
+    if not finished:
         return
 
     if way[0] == "r":
@@ -1600,6 +1630,137 @@ def calibrate_base(session):
     print("Saved on the arm: " + ", ".join(
         f"{k} = {saved[k]}" for k in ("BASE_RIGHT_MS", "BASE_LEFT_MS", "BASE_DIRECTION")) + ".")
     print("The base is centred and the arm knows it.")
+
+
+NUDGE_MS = 250      # one base nudge (l or r) while centring
+
+
+def _nudge_base(session, speed, heading):
+    """Let the user nudge the base with l / r until it faces straight ahead.
+
+    "rrr" nudges three times as far in one go. Returns on an empty answer.
+    """
+    while True:
+        key = input(heading + "   type l or r then Enter to nudge (rrr = 3 nudges), "
+                    "or just Enter when centred: ").strip().lower()
+        heading = ""
+        if not key:
+            return
+        if key[0] in "lr" and key == key[0] * len(key):
+            sign = -1 if key[0] == "l" else 1
+            ms = NUDGE_MS * len(key)
+            session.call("rotate_base", sign * speed, ms, timeout=ms / 1000 + 10)
+        else:
+            print("   Type l or r (or several, like rrr), or just Enter.")
+
+
+def _ask_degrees(prompt):
+    """How far the user says the base turned: degrees, or None when it was a
+    quarter turn (Enter, "ok", or 89-91: nobody judges finer than that)."""
+    while True:
+        text = input(prompt).strip().lower()
+        if text in ("", "ok", "y", "yes", "done"):
+            return None
+        try:
+            degrees = float(text.rstrip("°").removesuffix("deg").strip())
+        except ValueError:
+            print("   Type how many degrees it turned, e.g. 75, or 90 (or just Enter) "
+                  "if it was a quarter turn.")
+            continue
+        if abs(degrees - 90) <= 1:
+            return None
+        if 10 <= degrees <= 270:
+            return degrees
+        print("   Give a number of degrees between 10 and 270.")
+
+
+def tune_base(session):
+    """Set BASE_RIGHT_MS / BASE_LEFT_MS from turns the arm times itself.
+
+    Unlike base-calibrate there is no stopwatch: the arm runs the motor for
+    an exact time on its own clock, the user says how far the base turned,
+    and the time is scaled to make that 90 degrees. Repeat until it is. The
+    turns stop the same way normal turns do, so the motor's start-up and
+    coasting are counted just as they are in use. Also checks which way is
+    right. The 90 degree limit is off while it runs.
+    """
+    speed = _source_constant("BASE_TURN_SPEED", 40)
+    cal = get_calibration(session, ["BASE_RIGHT_MS", "BASE_DIRECTION"])
+    direction = cal["BASE_DIRECTION"]
+    right = None        # the motor sign that turns the base right, once known
+
+    def turn(sign, ms):
+        session.call("rotate_base", sign * speed, ms, timeout=ms / 1000 + 10)
+
+    def tune(name, sign, ms):
+        """Turn `name` from centre for ms, ask how far it went, scale, repeat."""
+        nonlocal right
+        while True:
+            _nudge_base(session, speed, "Nudge the base until it faces straight ahead:\n")
+            print(f"   Turning {name} for {ms} ms...")
+            turn(sign, ms)
+            went_left = False
+            if right is None:
+                while True:
+                    way = input("   Which way did it turn, [r]ight or [l]eft? (as seen "
+                                "from behind the arm) ").strip().lower()[:1]
+                    if way in ("r", "l"):
+                        break
+                right = 1 if way == "r" else -1
+                went_left = right == -1
+            degrees = _ask_degrees("   How many degrees did it turn? (90 or just Enter "
+                                   "if it was a quarter turn: that finishes) ")
+            turn(-sign, ms)                     # back towards centre
+            if went_left:
+                # Left and right were swapped; check it again turning right.
+                print("   Left and right are swapped on this arm; fixed. "
+                      "Next turn goes right.")
+                sign = right
+                if degrees is None:
+                    continue
+            elif degrees is None:
+                return ms
+            new = round(ms * 90 / degrees)
+            if new == ms:
+                return ms
+            if not 100 <= new <= 60000:
+                print(f"   That would make 90 deg {new} ms, which can't be right; "
+                      f"trying {ms} ms again.")
+                continue
+            print(f"   {degrees:g} deg in {ms} ms, so 90 deg should take about "
+                  f"{new} ms. Let's check.")
+            ms = new
+
+    session.call("set_base_limit", False, timeout=5)   # no limit while tuning
+    print("Base tuning. The arm times each turn itself; you just say how far it went.\n"
+          "Tip: mark straight ahead and 90 deg right and left on the table first.")
+    finished = False
+    try:
+        right_ms = tune("right", 1, cal["BASE_RIGHT_MS"])
+        same = input(f"Right turns are set: 90 deg = {right_ms} ms. Use the same time "
+                     "for left turns? [Y/n] ").strip().lower()[:1] != "n"
+        left_ms = right_ms if same else tune("left", -right, right_ms)
+        _nudge_base(session, speed, "Last step: nudge the base to straight ahead.\n")
+        finished = True
+    except (KeyboardInterrupt, EOFError):
+        print("\nTuning cancelled; nothing saved. Centre the base and run "
+              "'base-set 0'.")
+    finally:
+        if not finished:
+            _end_base_calibration(session)
+    if not finished:
+        return
+
+    if right == -1:
+        direction = -direction     # positive speed turned it left
+    saved = session.call("save_calibration",
+                         {"BASE_RIGHT_MS": right_ms, "BASE_LEFT_MS": left_ms,
+                          "BASE_DIRECTION": direction}, timeout=10)
+    session.call("set_base_angle", 0, timeout=5)
+    session.save_state()
+    print("Saved on the arm: " + ", ".join(
+        f"{k} = {saved[k]}" for k in ("BASE_RIGHT_MS", "BASE_LEFT_MS", "BASE_DIRECTION")) + ".")
+    print("The base is centred and the arm knows it. Try 'turn 90' and 'turn -90'.")
 
 
 # Joint calibration: (key prefix, name, arm method, question after a move
@@ -1810,6 +1971,7 @@ def align_joint(session):
 
 CALIBRATIONS["claw-calibrate"] = calibrate_claw
 CALIBRATIONS["base-calibrate"] = calibrate_base
+CALIBRATIONS["base-tune"] = tune_base
 CALIBRATIONS["arm-calibrate"] = calibrate_arm
 CALIBRATIONS["arm-align"] = align_joint
 

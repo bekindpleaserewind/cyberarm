@@ -15,7 +15,7 @@ Python, e.g. `.venv/bin/python arm_serial.py status` (Windows:
 `.venv\Scripts\python arm_serial.py status`).
 
 Some steps below need the user to watch the arm and press Enter at the right moment.
-Those (`claw-calibrate`, `base-calibrate`, `arm-calibrate`, `arm-align`, `shell`) are interactive: **do not run them
+Those (`claw-calibrate`, `base-tune`, `base-calibrate`, `arm-calibrate`, `arm-align`, `shell`) are interactive: **do not run them
 yourself**; give the user the exact command to run in their own terminal. The same goes
 for `radio-pair` and `radio-install`, which need the user to move USB cables.
 
@@ -28,7 +28,8 @@ The base angle is estimated from timing, so it can drift.
    arm that is centre: run `arm_serial.py base-set 0` once it physically faces straight
    ahead. (`base-set ANGLE` tells it any known angle.)
 2. If it always ends up short or overshoots, the timing is off: the user should run
-   `arm_serial.py base-calibrate` (interactive). It also fixes left/right being swapped.
+   `arm_serial.py base-tune` (interactive): the arm makes timed turns and the user says how
+   far each one went, until it is 90°. It also fixes left/right being swapped.
 
 ## The claw does not open or close fully, or keeps pushing at the end
 
