@@ -218,9 +218,9 @@ They save their results on the arm (`/arm_cal.json`), which overrides the defaul
   tune those the same way. The tries stop like normal turns do, so the motor's start-up
   and coasting are counted the same way as in use. Mark straight ahead and 90° on the
   table to judge the angle.
-- `base-calibrate`: the older way. You nudge the base to centre, then press Enter when it
-  has turned 90° and again when it is back. Your reaction time and the radio delay end up
-  in the result, so `base-tune` is usually more accurate.
+- `base-calibrate` is the old name and now runs `base-tune`. (The stopwatch method it
+  used, pressing Enter when the base reached 90°, put your reaction time and the radio
+  delay into the result, so it was removed.)
 
 ### Options
 
@@ -243,7 +243,7 @@ then auto-detection of the ESP32-C3 (skipping the paired remote).
 ```
 
 `before` and `status` hold the arm state before and after the command. Interactive
-commands (`shell`, `claw-calibrate`, `base-tune`, `base-calibrate`) are refused in JSON mode.
+commands (`shell`, `claw-calibrate`, `base-tune`, `arm-calibrate`) are refused in JSON mode.
 
 ### Examples
 
@@ -309,16 +309,27 @@ Our files in flash:
 
 | File                        | Size                                      |
 | --------------------------- | ----------------------------------------- |
-| `cyberbrick_arm.mpy`        | 6.0 KB                                    |
-| `arm_radio.mpy`             | 4.5 KB                                    |
+| `cyberbrick_arm.mpy`        | 7.0 KB                                    |
+| `arm_radio.mpy`             | 4.7 KB                                    |
 | `/lib/rc_main.mpy`          | 1.1 KB                                    |
 | Settings and version files  | < 1 KB                                    |
-| `*_old.mpy` after an update | up to 10.5 KB more                        |
+| `*_old.mpy` after an update | up to 12 KB more                          |
 | Remote: `arm_bridge.mpy`    | 1.1 KB, plus the 1.1 KB hook              |
 
 Radio mode has more RAM than USB mode because the stock remote-control app (and the
 LED, executor and sleep parts of `bbl`) are not loaded; only `bbl`'s servo and motor files
 are. `python arm_serial.py ping` shows the arm's free RAM at any time.
+
+Keeping RAM steady:
+
+- The 10 ms timer that drives the joints, claw and base uses whole numbers only, so it
+  creates no garbage. (Floats are separate objects on this board: the old joint glide
+  made about 29 KB of garbage a second while both joints moved, measured on the chip.)
+- The arm tidies its memory (`gc.collect()`) after each radio request while nothing is
+  moving, so a collection never lands in the middle of a move, and the free RAM shown by
+  `ping` is what is really free. It should stay about the same over time; if it keeps
+  falling, something is leaking.
+- `demo` runs from the PC one command at a time, so its code is not stored on the arm.
 
 ## cyberbrick_arm.py
 
@@ -427,7 +438,8 @@ on the PC against fakes of the MicroPython modules:
 | A joint can't extend far enough; its home is mid-way (e.g. servo 100) | `arm-align`: re-seats the arm part on the servo so home is at servo 0 |
 | A joint won't move by hand / feels stuck | Normal while the battery is on: the servo holds its angle. Move it with commands (or `+`/`-` in `arm-calibrate`), or `release` to let the joints go limp |
 | A joint doesn't move when commanded, or buzzes | Check the battery is on and charged; the joint may be pressing on something, so step it back the other way |
-| Radio: "no reply from the arm"           | Switch the arm on and wait 5 seconds. If you ran `remote`, switch the arm off and on to get back to radio mode. Move the remote closer. |
+| Radio: "no reply from the arm"           | The arm's radio hears the remote but radio mode is not answering. If you ran `remote`, the arm stays in stick mode until it is switched off and on; otherwise switch it off and on. |
+| Radio: "no radio contact with the arm, even after restarting the remote" | Nothing reached the arm. The PC already restarted the remote once (its radio can jam, for example after a soft reset from mpremote or Thonny). Check the arm is switched on and move the remote closer. |
 | Radio: "Could not find the CyberBrick remote" | Plug USB into the paired remote, or pass `--port`       |
 | Radio: "this board is a receiver"        | The cable is in the arm; move it to the remote               |
 | Radio: stick remote does nothing         | The remote is in bridge mode: run `remote` to hand back to the sticks |

@@ -15,7 +15,7 @@ Python, e.g. `.venv/bin/python arm_serial.py status` (Windows:
 `.venv\Scripts\python arm_serial.py status`).
 
 Some steps below need the user to watch the arm and press Enter at the right moment.
-Those (`claw-calibrate`, `base-tune`, `base-calibrate`, `arm-calibrate`, `arm-align`, `shell`) are interactive: **do not run them
+Those (`claw-calibrate`, `base-tune`, `arm-calibrate`, `arm-align`, `shell`) are interactive: **do not run them
 yourself**; give the user the exact command to run in their own terminal. The same goes
 for `radio-pair` and `radio-install`, which need the user to move USB cables.
 
@@ -81,7 +81,8 @@ strength and the arm's free RAM.
 
 | Error says                                  | Do this                                                       |
 | ------------------------------------------- | ------------------------------------------------------------- |
-| radio error: no reply from the arm          | Ask the user to switch the arm on (battery) and wait 5 seconds. If `remote` was used, the arm stays in stick mode until it is switched off and on. Move the remote closer. |
+| radio error: no reply from the arm          | The arm's radio hears the remote but radio mode is not answering. If `remote` was used, the arm stays in stick mode until it is switched off and on; otherwise ask the user to switch the arm off and on. |
+| radio error: no radio contact with the arm  | The driver already restarted the remote once. Ask the user to check the arm is switched on and to move the remote closer. |
 | Could not find the CyberBrick remote        | USB must go to the paired remote. Set `--port` / the plugin's `port` if needed. |
 | needs USB in the CyberBrick remote ... this board is a receiver | The cable is in the arm; move it to the remote. |
 | The bridge is not installed on this remote  | The user runs `arm_serial.py radio-pair` with USB in the remote. |

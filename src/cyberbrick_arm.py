@@ -11,7 +11,7 @@ Hardware (Receiver Shield)
 
 Libraries used (CyberBrick firmware, docs at
 https://makerworld.com/en/cyberbrick/api-doc/cyberbrick_core/lib/index.html):
-    bbl.servos.ServosController   set_angle / set_angle_stepping / set_speed / stop
+    bbl.servos.ServosController   its PWM pins (servos_map) / set_speed / stop
     bbl.motors.MotorsController   set_speed(-2048..2048) / stop
     rc_module                     rc_slave_init / rc_slave_data (optional remote)
 
@@ -46,7 +46,7 @@ override them:
                       (measure with `python arm_serial.py claw-calibrate`)
     * CLAW_START_OPEN whether the claw is open when the script starts
     * BASE_RIGHT_MS / BASE_LEFT_MS  time to turn 90 deg at BASE_TURN_SPEED
-                      (measure with `python arm_serial.py base-calibrate`)
+                      (measure with `python arm_serial.py base-tune`)
     * CLAW_OPEN_DIRECTION / BASE_DIRECTION flip if a part turns the wrong way
 
 The base angle is an estimate (0 = centre, negative = left, positive = right)
@@ -137,14 +137,14 @@ BASE_RIGHT_MS = 2000        # centre -> 90 deg right at BASE_TURN_SPEED (calibra
 BASE_LEFT_MS = 2000         # 90 deg right -> centre at BASE_TURN_SPEED (calibrate!)
 BASE_LIMIT_DEG = 90         # never turn further than this either side of centre
 
-# Timer driving smooth servo steps and the claw/base logic. The servo library
-# assumes it is called 100 times a second (10 ms).
+# Timer driving the joint glides and the claw/base logic, 100 times a second.
 TIMER_ID = 0
 TICK_MS = 10
 
 # Joint servo pulse, the same scale as the servo library (angle * 102/180 + 25
 # in 1/1024ths of 20 ms) but set in nanoseconds: the library's 10-bit duty
-# moves in 1.8 degree jumps, which makes slow moves jerky.
+# moves in 1.8 degree jumps, which makes slow moves jerky. Integers, so the
+# timer never makes a float.
 SERVO_NS0 = 488281
 SERVO_NS_PER_DEG = 11068
 # Joint speed 1 is SERVO_DEG_S deg/s on average (the library's step rate).
@@ -167,7 +167,7 @@ RC_JOINT_RATE = 90      # deg/s at full stick deflection
 RC_BASE_MAX = 60        # base speed (%) at full stick deflection
 RC_LOOP_MS = 20
 
-# Calibration saved on the board by claw-calibrate / base-calibrate /
+# Calibration saved on the board by claw-calibrate / base-tune /
 # arm-calibrate. Values in this file replace the defaults above when the
 # library starts.
 CAL_FILE = "/arm_cal.json"
@@ -285,8 +285,17 @@ class CyberBrickArm:
 
         self._running = True
 
-        # Joints have no position feedback, so start by sending them home.
+        # Joints: _cd is each servo's angle in hundredths of a degree, so the
+        # timer works in integers. _glide holds the moves in progress:
+        #   servo -> (start_cd, change_cd, start tick, duration ms)
+        # The servo library's own stepping is not used; switch it off in case
+        # the stock firmware left a step running.
+        self._joints = (LOWER_ARM_SERVO, UPPER_ARM_SERVO)
+        self._cd = {}
         self._glide = {}
+        for info in self.servos.servos_info_map:
+            info["step_en"] = False
+        # No position feedback, so start by sending the joints home.
         for servo, angle in self._home.items():
             self._set_servo(servo, angle)
 
@@ -297,10 +306,13 @@ class CyberBrickArm:
     # ------------------------------------------------------------------ timer
 
     def _tick(self, _timer):
+        # Runs 100 times a second, so it must not allocate: no floats, no new
+        # tuples or lists. Garbage made here would fill the heap and make the
+        # board stop for a collection every second or so while moving.
         try:
-            self.servos.timing_proc()
             now = time.ticks_ms()
-            self._update_joints(now)
+            if self._glide:
+                self._update_joints(now)
             self._update_claw(now)
             self._update_base(now)
         except Exception as e:
@@ -312,32 +324,35 @@ class CyberBrickArm:
             self._base_cmd = None
             self._base_applied = 0
 
-    def _write_servo(self, servo, angle):
-        self.servos.servos_info_map[servo - 1]["c_ang"] = angle
+    def _write_cd(self, servo, cd):
+        """Drive a joint servo to `cd` hundredths of a degree."""
+        self._cd[servo] = cd
         self.servos.servos_map[servo - 1].duty_ns(
-            int(SERVO_NS0 + angle * SERVO_NS_PER_DEG))
+            SERVO_NS0 + cd * SERVO_NS_PER_DEG // 100)
 
     def _set_servo(self, servo, angle):
-        """Put a joint servo at `angle` now, stopping any glide."""
+        """Put a joint servo at `angle` degrees now, stopping any glide."""
         self._glide.pop(servo, None)
-        self.servos.set_angle(servo, angle)     # the library's bookkeeping
-        self._write_servo(servo, angle)
+        self._write_cd(servo, int(angle * 100 + 0.5))
 
     def _update_joints(self, now):
         # Each glide eases in and out (smoothstep), so a joint speeds up and
         # slows down gently instead of jolting at the start, end and turns.
-        for servo in (LOWER_ARM_SERVO, UPPER_ARM_SERVO):
-            g = self._glide.get(servo)
+        # u and s are fractions in 1/1024ths: s = u * u * (3 - 2 * u).
+        glide = self._glide
+        for servo in self._joints:
+            g = glide.get(servo)
             if g is None:
                 continue
-            start, target, t0, dur = g
+            start, change, t0, dur = g
             t = time.ticks_diff(now, t0)
             if t >= dur:
-                del self._glide[servo]
-                self._write_servo(servo, target)
+                del glide[servo]
+                self._write_cd(servo, start + change)
                 continue
-            u = t / dur
-            self._write_servo(servo, start + (target - start) * u * u * (3 - 2 * u))
+            u = t * 1024 // dur
+            s = ((u * u) >> 10) * (3072 - 2 * u) >> 10
+            self._write_cd(servo, start + change * s // 1024)
 
     def _update_claw(self, now):
         dt = time.ticks_diff(now, self._claw_last_ms)
@@ -450,7 +465,8 @@ class CyberBrickArm:
     def servo_angle(self, servo):
         """Current commanded angle of a joint's servo (degrees)."""
         self._check_joint(servo)
-        return self.servos.servos_info_map[servo - 1]["c_ang"]
+        cd = self._cd[servo]
+        return cd // 100 if cd % 100 == 0 else cd / 100
 
     def joint_angle(self, servo):
         """Current position of a joint: 0 (home) .. 180 (fully extended) once
@@ -462,11 +478,6 @@ class CyberBrickArm:
         if want is not None and abs(self._to_servo(servo, want) - angle) <= 0.5:
             return want
         return self._to_position(servo, angle)
-
-    def joint_target(self, servo):
-        """Position the joint is moving towards."""
-        self._check_joint(servo)
-        return self._to_position(servo, self.servos.servos_info_map[servo - 1]["s_ang"])
 
     def home_position(self, servo):
         """The joint's home as a position (0 once calibrated)."""
@@ -485,13 +496,13 @@ class CyberBrickArm:
         self._want[servo] = position
         target = int(self._to_servo(servo, position) + 0.5)
         speed = int(_clamp(speed, 1, 100))
-        start = self.servo_angle(servo)
-        dur = int(abs(target - start) * 1000 / (speed * SERVO_DEG_S))
+        start = self._cd[servo]
+        change = target * 100 - start
+        dur = int(abs(change) * 10 / (speed * SERVO_DEG_S))
         if speed >= 100 or dur < TICK_MS:
             self._set_servo(servo, target)
         else:
-            self.servos.servos_info_map[servo - 1]["s_ang"] = target
-            self._glide[servo] = (start, target, time.ticks_ms(), dur)
+            self._glide[servo] = (start, change, time.ticks_ms(), dur)
         if wait:
             self.wait_joints()
 
@@ -535,7 +546,8 @@ class CyberBrickArm:
     def hold_joints(self):
         """Stop any joint movement in progress and hold the current angles."""
         for servo in self._limits:
-            self._set_servo(servo, self.servo_angle(servo))
+            self._glide.pop(servo, None)
+            self._write_cd(servo, self._cd[servo])
             self._want.pop(servo, None)
 
     def release_joints(self):

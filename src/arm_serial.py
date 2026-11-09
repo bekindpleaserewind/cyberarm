@@ -83,6 +83,7 @@ BAUD = 115200
 ESP32_C3_USB = (0x303A, 0x1001)
 
 RAW_BANNER = b"raw REPL; CTRL-B to exit\r\n>"
+PORT_WAIT_S = 120      # wait this long for another command to free the port
 CHUNK_BYTES = 256      # write size when sending code to the board
 WRITE_BYTES = 512      # file bytes per step when installing
 
@@ -229,10 +230,7 @@ class CyberBrickSerial:
             return False
 
         print(f"Connecting to {self.port}...")
-        try:
-            self.serial = serial.Serial(self.port, self.baud, timeout=0.1)
-        except (serial.SerialException, OSError) as e:
-            print(f"Connection failed: {e}")
+        if not self._open():
             return False
 
         if self.enter_raw_repl():
@@ -246,6 +244,34 @@ class CyberBrickSerial:
 
         print("Could not reach the MicroPython REPL on", self.port)
         return False
+
+    def _open(self):
+        """Open the port for this process only.
+
+        Two programs on one board break each other: each one's Ctrl-C stops
+        what the other is running. So the port is locked, and a second
+        arm_serial.py (say a CLI command while the OpenClaw gateway is busy)
+        waits for the first to finish instead.
+        """
+        deadline = time.monotonic() + PORT_WAIT_S
+        waiting = False
+        while True:
+            try:
+                self.serial = serial.Serial(self.port, self.baud, timeout=0.1,
+                                            exclusive=True)
+                return True
+            except (serial.SerialException, OSError) as e:
+                text = str(e)
+                busy = any(s in text for s in ("exclusively lock", "Access is denied",
+                                               "busy", "Resource temporarily"))
+                if not busy or time.monotonic() > deadline:
+                    print(f"Connection failed: {e}")
+                    return False
+                if not waiting:
+                    print(f"{self.port} is in use by another program (another "
+                          "arm_serial.py command or the OpenClaw gateway); waiting...")
+                    waiting = True
+                time.sleep(0.5)
 
     def _hard_reset(self):
         """Toggle DTR/RTS to reboot the board (same sequence as CyberClaw)."""
@@ -432,9 +458,10 @@ def compile_source(source, path, board_mpy):
     return data
 
 
-# Board-library functions only used when it runs standalone with the RC
-# remote; not needed over serial, so they are not sent to the board.
-SKIP_FUNCTIONS = {"_stick", "run_rc", "rc_monitor", "main"}
+# Board-library functions only used when it runs standalone (the demo and
+# the RC remote); not needed over serial, so they are not sent to the board.
+# The PC runs the demo itself, one command at a time (run_demo).
+SKIP_FUNCTIONS = {"demo", "_stick", "run_rc", "rc_monitor", "main"}
 
 # The stock firmware already has Bambu's bbl servo/motor library loaded, so
 # the arm library reuses it for free. If it is missing (board interrupted
@@ -742,7 +769,7 @@ class ArmSession:
         if installed == version:
             print("Using the arm library installed on the board.")
             self.link.exec(f"import sys\nsys.modules.pop({INSTALL_MODULE!r}, None)\n"
-                           f"from {INSTALL_MODULE} import CyberBrickArm, demo",
+                           f"from {INSTALL_MODULE} import CyberBrickArm",
                            timeout=15)
         else:
             if installed:
@@ -953,6 +980,8 @@ class ArmSession:
             raise
 
     def run_call(self, call, timeout):
+        if call.method == "demo":
+            return _stop_on_ctrl_c(self, run_demo)
         return self.run(usb_code(call), timeout)
 
     def call(self, method, *args, timeout=60, **kwargs):
@@ -994,9 +1023,23 @@ class RadioSession:
                 "or use --transport usb to drive the arm over its own USB.")
 
     def _reboot_remote(self):
-        """Reboot the remote and reconnect once it is back."""
+        """Restart the remote and reconnect once it is back.
+
+        The USB reset lines restart the whole chip, radio included.
+        machine.reset() does not always free a jammed radio (seen on the
+        remote after a soft reset), so it is only the fallback for when the
+        lines do nothing."""
+        self.link.exec("_rr = 1")           # gone once the board restarted
+        if self.link._hard_reset():
+            self.link.close()
+            self._reconnect()
+            if self.link.exec("print('_rr' in globals())").strip() == "False":
+                return
         self.link.send_and_reboot()
         self.link.close()
+        self._reconnect()
+
+    def _reconnect(self):
         deadline = time.monotonic() + 15
         time.sleep(2)
         while time.monotonic() < deadline:
@@ -1011,13 +1054,14 @@ class RadioSession:
         """Start the bridge on the remote, rebooting it into bridge mode if the
         stock firmware (which owns the radio) is running."""
         state = self.link.exec(
-            "import sys, os\n"
+            "import sys, os, machine\n"
             "try:\n"
             f" os.stat({BRIDGE_PATH!r})\n"
             " _i = 1\n"
             "except OSError:\n"
             " _i = 0\n"
-            "print(_i, int('rc_module' in sys.modules))\n"
+            "print(_i, int('rc_module' in sys.modules),\n"
+            "      int(machine.reset_cause() == machine.SOFT_RESET))\n"
             "del _i").split()
         if state[0] != "1":
             raise UsageError("The bridge is not installed on this remote. Run "
@@ -1026,13 +1070,23 @@ class RadioSession:
             print("Switching the remote to bridge mode (it reboots once)...")
             self.link.exec(f"with open({MODE_FILE!r}, 'w') as _f:\n _f.write('bridge')")
             self._reboot_remote()
+        elif state[2] == "1":
+            # After a soft reset (Ctrl-D, mpremote, Thonny) Wi-Fi still says
+            # it is on, but nothing the remote sends goes out: every request
+            # would fail with "no reply from the arm". A real restart fixes it.
+            print("The remote was soft-reset, which leaves its radio unable to "
+                  "send; restarting it...")
+            self._reboot_remote()
+        self._start_bridge()
+
+    def _start_bridge(self):
         p = self.pair
         self.link.exec(f"import arm_bridge\n_b = arm_bridge.get({p['arm_mac']!r}, "
                        f"{p['pmk']!r}, {p['lmk']!r}, {p['channel']!r})", timeout=15)
 
     # ------------------------------------------------------------- the link
 
-    def request(self, body, timeout_s=10):
+    def request(self, body, timeout_s=10, retry=True):
         """Send one request to the arm; returns (status, result)."""
         text = json.dumps(body)[1:]          # the bridge adds "[seq, "
         try:
@@ -1040,10 +1094,24 @@ class RadioSession:
                 f"print(_b.call({text!r}, {int(timeout_s * 1000) + 3000}))",
                 timeout=timeout_s + 15)
         except DeviceError as e:
-            raise RadioError(
-                f"{str(e).splitlines()[-1]}.\nIs the arm switched on and in radio "
-                "mode (it boots into it)? After 'remote' it stays in stick mode "
-                "until it is switched off and on again.")
+            error = str(e).splitlines()[-1]
+            if "no radio contact" not in error:
+                raise RadioError(
+                    f"{error}.\nThe arm's radio hears the remote, but radio mode is "
+                    "not answering. After 'remote' it stays in stick mode until it "
+                    "is switched off and on again; otherwise switch it off and on.")
+            if not retry:
+                raise RadioError(
+                    "no radio contact with the arm, even after restarting the "
+                    "remote.\nIs the arm switched on? Move the remote closer.")
+            # Not one message reached the arm, so it never saw this request
+            # and sending it again is safe. Most often the remote's own radio
+            # is jammed, and only restarting its chip frees it.
+            print("No radio contact with the arm; restarting the remote's radio "
+                  "and trying again...")
+            self._reboot_remote()
+            self._start_bridge()
+            return self.request(body, timeout_s, retry=False)
         reply = json.loads(out.strip().splitlines()[-1])
         if reply[1] == "E":
             raise DeviceError(reply[2])
@@ -1128,50 +1196,14 @@ class RadioSession:
         if call.method == "raw":
             raise UsageError("'raw' runs code on the board, so it only works over "
                              "USB (--transport usb with USB in the arm).")
-        try:
-            if call.method == "demo":
-                return self._demo()
-            if call.method == "status":
-                status = self.ping()
-            else:
-                status = self.request(["c", call.method, list(call.args),
-                                       call.kwargs, timeout], timeout)[0]
-        except KeyboardInterrupt:
-            print("\nInterrupted, stopping the arm...")
-            if self.link.interrupt():
-                self.request(["c", "stop_all", [], {}, 10])
-                self.save_state()
-            raise
+        if call.method == "demo":
+            return _stop_on_ctrl_c(self, run_demo)
+        if call.method == "status":
+            status = _stop_on_ctrl_c(self, lambda s: s.ping())
+        else:
+            status = _stop_on_ctrl_c(self, lambda s: s.request(
+                ["c", call.method, list(call.args), call.kwargs, timeout], timeout)[0])
         text = repr(_public(status))
-        print(text)
-        return text + "\n"
-
-    def _demo(self):
-        """The board library's demo(), run one step at a time over the radio."""
-        lo, up = home_positions(get_calibration(self, ARM_KEYS))
-        reach = ("move_arm", lo + 35, up - 25)
-        rest = ("move_arm", lo, up)
-        steps = [
-            "home", ("home",), 0.5,
-            "claw open / close", ("open_claw",), 0.3, ("close_claw",), 0.3,
-            "lower arm (S1) sweep", ("move_lower_arm", lo + 30),
-            ("move_lower_arm", lo - 30), ("move_lower_arm", lo),
-            "upper arm (S2) sweep", ("move_upper_arm", up + 30),
-            ("move_upper_arm", up - 30), ("move_upper_arm", up),
-            "base (M2) left / right", ("turn_base", 45), 0.3, ("turn_base", -45), 0.3,
-            ("turn_base", 0),
-            "pick and place", ("open_claw",), reach, ("close_claw",), rest,
-            ("turn_base", 60), reach, ("open_claw",), rest, ("turn_base", 0),
-            ("close_claw",),
-        ]
-        for step in steps:
-            if isinstance(step, str):
-                print("[demo]", step)
-            elif isinstance(step, float):
-                time.sleep(step)
-            else:
-                self.call(step[0], *step[1:])
-        text = f"[demo] done: {_public(self.last_status)}"
         print(text)
         return text + "\n"
 
@@ -1232,6 +1264,52 @@ class RadioSession:
         if status.get("timer_error"):
             print("Timer error on the arm:", status["timer_error"])
         print("Status:", _public(status))
+
+
+def _stop_on_ctrl_c(session, job):
+    """Run job(session); on Ctrl-C, stop the arm before passing it on."""
+    try:
+        return job(session)
+    except KeyboardInterrupt:
+        print("\nInterrupted, stopping the arm...")
+        if session.link.interrupt():
+            session.call("stop_all", timeout=10)
+            session.save_state()
+        raise
+
+
+def run_demo(session):
+    """Exercise every joint, the claw and the base, then pick and place.
+
+    The same steps as demo() in cyberbrick_arm.py, sent one command at a time
+    (over USB or the radio), so the arm itself does not need the demo code.
+    """
+    lo, up = home_positions(get_calibration(session, ARM_KEYS))
+    reach = ("move_arm", lo + 35, up - 25)
+    rest = ("move_arm", lo, up)
+    steps = [
+        "home", ("home",), 0.5,
+        "claw open / close", ("open_claw",), 0.3, ("close_claw",), 0.3,
+        "lower arm (S1) sweep", ("move_lower_arm", lo + 30),
+        ("move_lower_arm", lo - 30), ("move_lower_arm", lo),
+        "upper arm (S2) sweep", ("move_upper_arm", up + 30),
+        ("move_upper_arm", up - 30), ("move_upper_arm", up),
+        "base (M2) left / right", ("turn_base", 45), 0.3, ("turn_base", -45), 0.3,
+        ("turn_base", 0),
+        "pick and place", ("open_claw",), reach, ("close_claw",), rest,
+        ("turn_base", 60), reach, ("open_claw",), rest, ("turn_base", 0),
+        ("close_claw",),
+    ]
+    for step in steps:
+        if isinstance(step, str):
+            print("[demo]", step)
+        elif isinstance(step, float):
+            time.sleep(step)
+        else:
+            session.call(step[0], *step[1:])
+    text = f"[demo] done: {_public(session.status())}"
+    print(text)
+    return text + "\n"
 
 
 # machine.reset_cause() on the ESP32-C3, as reported by the arm.
@@ -1329,8 +1407,6 @@ def usb_code(call):
     """The MicroPython code that runs a command over USB."""
     if call.method == "status":
         return "print(arm.status())"
-    if call.method == "demo":
-        return "demo(arm)"
     if call.method == "raw":
         return call.args[0]
     return "arm." + _params(call.method, call.args, call.kwargs) + STATUS
@@ -1464,8 +1540,8 @@ SESSION_COMMANDS = {
     "install":   "install                      save arm library on the board (USB)",
     "uninstall": "uninstall                    remove it and radio mode from the board (USB)",
     "claw-calibrate": "claw-calibrate               time a full claw open and close and save them",
-    "base-calibrate": "base-calibrate               time 90 deg base turns and save them",
     "base-tune": "base-tune                    set 90 deg base turns by how far timed turns go",
+    "base-calibrate": "base-calibrate               same as base-tune",
     "arm-calibrate": "arm-calibrate                set each joint's home and fully extended position",
     "arm-align": "arm-align                    re-seat a joint on its servo so it can use the full 0-180",
     "gesture":   "gesture wave|nod|shake [TIMES] [SPEED]  smooth gesture, then back to the start pose",
@@ -1543,8 +1619,8 @@ def calibrate_claw(session):
 
 
 def _end_base_calibration(session):
-    """Stop the base and put its 90 degree limit back on after a base
-    calibration ends early: Ctrl-C (perhaps in the middle of a radio call,
+    """Stop the base and put its 90 degree limit back on after base-tune
+    ends early: Ctrl-C (perhaps in the middle of a radio call,
     which leaves the remote busy) or a lost link. Never raises."""
     try:
         session.link.interrupt()
@@ -1556,80 +1632,6 @@ def _end_base_calibration(session):
     except Exception as e:
         print(f"Could not put the base's 90 deg limit back on ({e}).\n"
               "Switch the arm off and on before using the base.")
-
-
-def calibrate_base(session):
-    """Time 90 degree base turns and save BASE_RIGHT_MS / BASE_LEFT_MS.
-
-    The base motor has no position sensor, so its angle is worked out from
-    how long it has turned. This also checks which way is right and fixes
-    BASE_DIRECTION if needed. The 90 degree limit is off while it runs.
-    """
-    speed = _source_constant("BASE_TURN_SPEED", 40)
-    direction = get_calibration(session, ["BASE_DIRECTION"])["BASE_DIRECTION"]
-
-    def spin(sign):
-        session.call("base_speed", sign * speed, timeout=5)
-
-    def stop():
-        session.call("base_stop", timeout=5)
-
-    session.call("set_base_limit", False, timeout=5)   # no limit while calibrating
-    print("Base calibration. Watch the arm and press Enter at each step.")
-    finished = False
-    try:
-        _nudge_base(session, speed, "1) Nudge the base until the arm faces straight ahead:\n")
-
-        _wait_enter("2) Press Enter to start turning (this is timed)...")
-        spin(1)
-        t0 = time.monotonic()
-        t1 = _wait_enter("   Press Enter the moment the arm has turned a quarter "
-                         "turn (90 deg).")
-        stop()
-        first_ms = int((t1 - t0) * 1000)
-
-        while True:
-            way = input("   Which way did it turn, [r]ight or [l]eft? "
-                        "(as seen from behind the arm) ").strip().lower()
-            if way[:1] in ("r", "l"):
-                break
-
-        _wait_enter("3) Press Enter to turn back to centre (this is timed)...")
-        spin(-1)
-        t0 = time.monotonic()
-        t1 = _wait_enter("   Press Enter the moment it faces straight ahead again.")
-        stop()
-        back_ms = int((t1 - t0) * 1000)
-        finished = True
-    except (KeyboardInterrupt, EOFError):
-        print("\nCalibration cancelled; nothing saved.")
-    finally:
-        if not finished:
-            _end_base_calibration(session)
-    if not finished:
-        return
-
-    if way[0] == "r":
-        right_ms, left_ms = first_ms, back_ms
-    else:
-        # Positive speed turned it left: swap the direction and the timings.
-        direction = -direction
-        right_ms, left_ms = back_ms, first_ms
-    print(f"90 deg right took {right_ms} ms, 90 deg left took {left_ms} ms.")
-    if min(right_ms, left_ms) < 200:
-        session.call("set_base_limit", True, timeout=5)
-        session.call("set_base_angle", 0, timeout=5)
-        session.save_state()
-        print("That is too short to be right; nothing saved.")
-        return
-    saved = session.call("save_calibration",
-                         {"BASE_RIGHT_MS": right_ms, "BASE_LEFT_MS": left_ms,
-                          "BASE_DIRECTION": direction}, timeout=10)
-    session.call("set_base_angle", 0, timeout=5)
-    session.save_state()
-    print("Saved on the arm: " + ", ".join(
-        f"{k} = {saved[k]}" for k in ("BASE_RIGHT_MS", "BASE_LEFT_MS", "BASE_DIRECTION")) + ".")
-    print("The base is centred and the arm knows it.")
 
 
 NUDGE_MS = 250      # one base nudge (l or r) while centring
@@ -1677,7 +1679,7 @@ def _ask_degrees(prompt):
 def tune_base(session):
     """Set BASE_RIGHT_MS / BASE_LEFT_MS from turns the arm times itself.
 
-    Unlike base-calibrate there is no stopwatch: the arm runs the motor for
+    There is no stopwatch: the arm runs the motor for
     an exact time on its own clock, the user says how far the base turned,
     and the time is scaled to make that 90 degrees. Repeat until it is. The
     turns stop the same way normal turns do, so the motor's start-up and
@@ -1970,8 +1972,8 @@ def align_joint(session):
 
 
 CALIBRATIONS["claw-calibrate"] = calibrate_claw
-CALIBRATIONS["base-calibrate"] = calibrate_base
 CALIBRATIONS["base-tune"] = tune_base
+CALIBRATIONS["base-calibrate"] = tune_base      # the old name
 CALIBRATIONS["arm-calibrate"] = calibrate_arm
 CALIBRATIONS["arm-align"] = align_joint
 

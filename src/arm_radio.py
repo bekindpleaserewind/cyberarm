@@ -360,6 +360,11 @@ def serve(server):
             msg = radio.recv(10)
             if msg:
                 server.handle(msg)
+                if not server.wait:
+                    # Tidy up after each request while no move is running:
+                    # garbage never piles up into a long pause at a bad
+                    # moment, and status() "mem" shows what is really free.
+                    gc.collect()
             server.poll()
             if server.reboot:
                 if server.reboot == "stock":

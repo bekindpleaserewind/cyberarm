@@ -98,6 +98,7 @@ machine = types.ModuleType("machine")
 machine.Timer, machine.Pin = Timer, Pin
 machine.reset = lambda: (_ for _ in ()).throw(SystemExit("machine.reset"))
 machine.PWRON_RESET, machine.HARD_RESET, machine.WDT_RESET = 1, 2, 3
+machine.SOFT_RESET = 5
 machine.reset_cause = lambda: machine.HARD_RESET
 sys.modules["machine"] = machine
 
@@ -118,6 +119,7 @@ class ServosController:
                                  "step": 1.0} for _ in range(4)]
         self.servos_map = [PWM() for _ in range(4)]
         self.speeds = [0] * 4
+        self.proc_calls = 0
 
     def set_angle(self, i, angle):
         self.servos_info_map[i - 1].update(c_ang=float(angle), s_ang=float(angle),
@@ -130,6 +132,7 @@ class ServosController:
         self.servos_info_map[i - 1].update(s_ang=float(angle), step_en=True)
 
     def timing_proc(self):
+        self.proc_calls += 1
         for m in self.servos_info_map:
             if m["step_en"]:
                 d = m["s_ang"] - m["c_ang"]
@@ -307,6 +310,15 @@ class RadioTest(unittest.TestCase):
         self.link.ns["_b"] = arm_bridge.Bridge(PAIR["arm_mac"], PAIR["pmk"],
                                                PAIR["lmk"], PAIR["channel"])
         self.session = arm_serial.RadioSession(self.link, dict(PAIR))
+        self.remote_restarts = 0
+
+        def restart_remote():
+            self.remote_restarts += 1
+            for hook in self.on_remote_restart:
+                hook()
+        self.on_remote_restart = []
+        self.session._reboot_remote = restart_remote
+        self.session._start_bridge = lambda: None
 
     def tearDown(self):
         self.arm.shutdown()
@@ -414,11 +426,28 @@ class RadioTest(unittest.TestCase):
         self.assertEqual(self.session.ping()["boot"], 1234)
 
     def test_a_long_outage_gives_a_radio_error_after_about_5_s(self):
+        # The arm's radio acknowledged the messages (they were lost after
+        # that), so it is not the remote's fault: no restart, no resend.
         self._radio_outage(60000)
         start = CLOCK.now
-        with self.assertRaises(arm_serial.RadioError):
+        with self.assertRaises(arm_serial.RadioError) as cm:
             self.session.ping()
         self.assertAlmostEqual(CLOCK.now - start, arm_bridge.NO_REPLY_MS, delta=400)
+        self.assertIn("no reply from the arm", str(cm.exception))
+        self.assertEqual(self.remote_restarts, 0)
+
+    def test_a_jammed_remote_radio_is_restarted_and_the_request_resent(self):
+        bridge = self.link.ns["_b"]
+        real_send = bridge.e.send
+
+        def jammed(*args):
+            raise OSError(116)              # ETIMEDOUT, as seen on the remote
+        bridge.e.send = jammed
+        self.on_remote_restart.append(lambda: setattr(bridge.e, "send", real_send))
+        self.quiet(self.session.call, "turn_base_by", 10)
+        self.assertEqual(self.remote_restarts, 1)
+        self.assertEqual(self.calls.count("turn_base_by"), 1)   # run once only
+        self.assertAlmostEqual(self.arm.base_angle(), 10, delta=1)
 
     def test_status_always_fits_in_one_message(self):
         self.server.error = "OSError: " + "x" * 300
@@ -449,13 +478,15 @@ class RadioTest(unittest.TestCase):
 
     def test_no_arm_gives_a_radio_error(self):
         del AIR.nodes[ARM_MAC]
-        with self.assertRaises(arm_serial.RadioError):
-            self.session.ping()
+        with self.assertRaises(arm_serial.RadioError) as cm:
+            self.quiet(self.session.ping)
+        self.assertIn("even after restarting the remote", str(cm.exception))
+        self.assertEqual(self.remote_restarts, 1)              # tried once
 
     def test_wrong_key_is_not_heard(self):
         self.server.radio.e.peers[REMOTE_MAC] = b"x" * 16
         with self.assertRaises(arm_serial.RadioError):
-            self.session.ping()
+            self.quiet(self.session.ping)
 
     def test_messages_from_other_boards_are_ignored(self):
         AIR.next_mac = b"\xcc" * 6
@@ -796,8 +827,41 @@ class RadioTest(unittest.TestCase):
         self.session.call("move_upper_arm", 180, speed=100)
         self.session.call("stop_all")                 # hold: no target to report
         self.assertEqual(self.arm.joint_angle(2), 180)
-        self.arm.servos.servos_info_map[1]["c_ang"] = 120  # e.g. half way there
+        self.arm._cd[2] = 12000                       # e.g. half way there
         self.assertAlmostEqual(self.arm.joint_angle(2), 45)
+
+    def test_timer_works_in_integers_only(self):
+        # The 10 ms timer must not make floats (each one is garbage on the
+        # board) and does not need the servo library's stepping.
+        pwm = self.arm.servos.servos_map[0]
+        pwm.history.clear()
+        self.arm.servos.proc_calls = 0
+        self.session.call("move_lower_arm", 37.3, speed=7)
+        self.session.call("set_claw", 0.5)
+        self.session.call("turn_base", 33)
+        self.assertGreater(len(pwm.history), 100)
+        self.assertTrue(all(type(ns) is int for ns in pwm.history))
+        self.assertTrue(all(type(cd) is int for cd in self.arm._cd.values()))
+        self.assertTrue(all(type(v) is int for v in (
+            self.arm._claw_pos, self.arm._base_pos, self.arm._claw_applied,
+            self.arm._base_applied)))
+        self.assertEqual(self.arm.servos.proc_calls, 0)
+        self.assertIsNone(self.arm.timer_error)
+        self.assertEqual(self.arm.servo_angle(1), 37)
+
+    def test_demo_runs_from_the_pc(self):
+        self.quiet(arm_serial.run_demo, self.session)
+        moves = [c for c in self.calls if c != "calibration"]
+        self.assertEqual(moves[:3], ["home", "open_claw", "close_claw"])
+        self.assertEqual(moves[-1], "close_claw")
+        status = self.session.status()
+        self.assertEqual((status["base_angle"], status["claw"]), (0, 0.0))
+
+    def test_demo_is_not_sent_to_the_board(self):
+        names = {getattr(n, "name", None)
+                 for n in arm_serial.library_tree(arm_serial.DEVICE_LIB).body}
+        self.assertNotIn("demo", names)
+        self.assertIn("CyberBrickArm", names)
 
     # --------------------------------------------------------------- updates
 
@@ -865,7 +929,43 @@ class UsbCodeTest(unittest.TestCase):
             self.assertEqual(arm_serial.usb_code(call), code + arm_serial.STATUS, name)
         self.assertEqual(arm_serial.usb_code(arm_serial.cmd_status([])[0]),
                          "print(arm.status())")
-        self.assertEqual(arm_serial.usb_code(arm_serial.cmd_demo([])[0]), "demo(arm)")
+        self.assertIs(arm_serial.CALIBRATIONS["base-calibrate"], arm_serial.tune_base)
+
+
+class PortLockTest(unittest.TestCase):
+    """A second arm_serial.py waits for the port instead of breaking in."""
+
+    def _open(self, errors):
+        attempts = []
+
+        def fake_serial(*args, **kw):
+            attempts.append(kw.get("exclusive"))
+            if errors:
+                raise arm_serial.serial.SerialException(errors.pop(0))
+            return object()
+        link = arm_serial.CyberBrickSerial("/dev/ttyACM9")
+        link.port = "/dev/ttyACM9"
+        real, arm_serial.serial.Serial = arm_serial.serial.Serial, fake_serial
+        real_sleep, time.sleep = time.sleep, lambda s: None
+        try:
+            with contextlib.redirect_stdout(io.StringIO()) as out:
+                ok = link._open()
+        finally:
+            arm_serial.serial.Serial, time.sleep = real, real_sleep
+        return ok, attempts, out.getvalue()
+
+    def test_waits_while_another_command_has_the_port(self):
+        ok, attempts, out = self._open([
+            "Could not exclusively lock port /dev/ttyACM9: [Errno 11] Resource "
+            "temporarily unavailable"] * 3)
+        self.assertTrue(ok)
+        self.assertEqual(attempts, [True] * 4)
+        self.assertEqual(out.count("in use by another program"), 1)
+
+    def test_other_errors_fail_at_once(self):
+        ok, attempts, out = self._open(["[Errno 2] No such file or directory"])
+        self.assertFalse(ok)
+        self.assertEqual(len(attempts), 1)
 
 
 class BootHookTest(unittest.TestCase):
@@ -925,6 +1025,20 @@ class BootHookTest(unittest.TestCase):
         finally:
             machine.reset_cause = real
         self.assertEqual(self.tried, [("arm_radio_fake", "lib")])
+
+    def test_soft_reset_restarts_the_board_first(self):
+        # A soft reset leaves Wi-Fi unable to send, so radio mode must not
+        # start on top of it.
+        arm_boot.TRIES = (("arm_radio_fake", "lib"),)
+        self._modules(set())
+        real = machine.reset_cause
+        machine.reset_cause = lambda: machine.SOFT_RESET
+        try:
+            with self.assertRaises(SystemExit):
+                arm_boot._receiver()
+        finally:
+            machine.reset_cause = real
+        self.assertEqual(self.tried, [])
 
     def test_everything_broken_means_stock(self):
         arm_boot.TRIES = (("arm_radio_fake", "lib"),)

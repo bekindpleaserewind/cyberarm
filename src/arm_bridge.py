@@ -56,13 +56,16 @@ class Bridge:
 
         body is the request without its sequence number, as JSON text after
         the opening bracket: '"c", "turn_base", [45], {}, 60]'.
-        Raises OSError if the arm does not answer.
+        Raises OSError if the arm does not answer: "no radio contact" when
+        not one message was acknowledged by the arm's radio (so the arm never
+        got the request), "no reply from the arm" when its radio heard us.
         """
         self.seq = (self.seq + 1) & 0xFFFF
         seq = self.seq
         msg = "[%d, %s" % (seq, body)
         start = time.ticks_ms()
         sent = heard = None
+        acked = False
         while True:
             now = time.ticks_ms()
             # Until the arm answers, resend quickly. After that, check in now
@@ -70,11 +73,13 @@ class Bridge:
             gap = 300 if heard is None else 1500
             if sent is None or time.ticks_diff(now, sent) >= gap:
                 if heard is None and time.ticks_diff(now, start) >= NO_REPLY_MS:
-                    raise OSError("no reply from the arm")
+                    raise OSError("no reply from the arm" if acked
+                                  else "no radio contact")
                 try:
-                    self.e.send(self.peer, msg, True)
+                    if self.e.send(self.peer, msg, True):
+                        acked = True
                 except OSError:
-                    pass
+                    pass                # e.g. ETIMEDOUT: this radio is jammed
                 sent = now
             if time.ticks_diff(now, start) > timeout_ms:
                 raise OSError("timed out waiting for the arm")

@@ -176,8 +176,7 @@ python arm_serial.py calibration       # show what the arm is using
 
 `base-tune` needs no stopwatch: the arm times each turn itself and you say how far the
 base went (for example `70`), until a turn is exactly 90°. Mark straight ahead and 90°
-on the table first. (`base-calibrate` is the older way: you press Enter when the base
-reaches 90°, so your reaction time ends up in the result.)
+on the table first. (`base-calibrate` is the old name and now runs `base-tune`.)
 
 `arm-calibrate` moves the joints from the keyboard (`+`, `-`, `+20`, or a servo angle),
 not by hand: while the battery is on, the servos hold their position firmly.
@@ -291,7 +290,6 @@ them all. Joint positions run from 0 (home, folded) to 180 (fully extended). `SP
 | `arm-calibrate` | Set each joint's home and fully extended position, and which way it moves |
 | `arm-align` | Re-seat a joint on its servo so home is at the servo's end, then calibrate |
 | `base-tune` | Set 90° base turns: the arm times each turn, you say how far it went; also checks which way is right |
-| `base-calibrate` | Older way: time 90° base turns by pressing Enter |
 | `claw-calibrate` | Time a full claw open and close |
 | `calibration` | Show every calibration value the arm uses |
 
