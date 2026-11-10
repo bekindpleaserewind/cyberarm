@@ -80,15 +80,14 @@ From then on every command goes over the radio.
 ### USB only
 
 ```bash
-python arm_serial.py install      # store the library on the board
 python arm_serial.py arm-calibrate
 python arm_serial.py base-tune
 ```
 
-- `install` compiles `cyberbrick_arm.py` and saves it on the board's flash. It stays there
-  across power cycles, and the board still boots into its normal remote-control mode.
-  Run it again after any edit to `cyberbrick_arm.py`. Without it, the library is uploaded
-  into RAM on every command, which is slower.
+- The first USB command compiles `cyberbrick_arm.py` and saves it on the board's flash,
+  and so does the next one after any edit to it. It stays there across power cycles, and
+  the board still boots into its normal remote-control mode. (`install` does the same
+  straight away.)
 - `base-tune` sets how long the base takes to turn 90°. Until you run it, the base
   uses a guessed time and its "90°" may not be a real 90°.
 
@@ -124,7 +123,7 @@ position 90. Before calibration, positions are the raw servo angles 0-180, with 
 | `claw open`             | Open fully                                                    |
 | `claw close`            | Close fully                                                   |
 | `claw 0.5`              | Go to a position between 0 (closed) and 1 (open)              |
-| `claw-cal open\|closed` | Tell the arm the claw is fully open or closed right now       |
+| `claw-set open\|closed` | Tell the arm the claw is fully open or closed right now (old name `claw-cal`) |
 | `claw-spin SPEED`       | Spin S3 freely at -100..100, ignoring limits; `0` stops       |
 
 ### Base
@@ -151,7 +150,6 @@ themselves after 20 seconds, in case the stop command is lost.
 | `ping`              | Check the link: reply time, signal strength, free RAM, why the arm last restarted |
 | `update [--force]`  | Send edited `cyberbrick_arm.py` / `arm_radio.py` to the arm over the radio |
 | `remote`            | Hand the arm to the stick remote until the arm is switched off and on |
-| `reset`             | Restart the arm (radio: back into radio mode)                        |
 
 ### Other
 
@@ -165,8 +163,8 @@ themselves after 20 seconds, in case the stop command is lost.
 | `raw CODE`   | USB only: run MicroPython on the board, e.g. `raw "print(arm.status())"` |
 | `shell`      | Interactive `arm>` prompt; type the same commands without `python arm_serial.py` |
 | `probe`      | USB: report the board's free RAM and flash, files and boot scripts (read-only) |
-| `reset`      | USB: reboot the board back into normal remote-control mode          |
-| `install`    | USB: save the arm library on the board                              |
+| `reset`      | Restart the arm: into radio mode once `radio-install` was run, otherwise its normal remote-control mode |
+| `install`    | USB: save the arm library on the board now (USB commands do it anyway when it changed) |
 | `uninstall`  | USB: remove the arm library and radio mode from the board           |
 
 ### Calibration (interactive)
@@ -230,6 +228,7 @@ They save their results on the arm (`/arm_cal.json`), which overrides the defaul
 | `--transport` | `radio`, `usb`, or `auto` (default: radio once `radio-install` was run); also `$CYBERBRICK_TRANSPORT` |
 | `--json`      | Print one JSON object on stdout (for programs such as the OpenClaw plugin) |
 | `--reload`    | USB: reload the library on the board even if it is already running   |
+| `--baud N`    | Serial speed (default 115200)                                         |
 | `-v`          | Print serial connection details, for debugging                        |
 
 Without `--port`, the radio uses `$CYBERBRICK_REMOTE_PORT` or finds the paired remote by
@@ -340,7 +339,8 @@ file to change settings or add features.
 ### Settings
 
 The settings are in the `CONFIG` section at the top. After changing any of them, run
-`python arm_serial.py update` (radio) or `install` (USB).
+`python arm_serial.py update` (radio). Over USB, the next command installs the changed
+file by itself.
 
 | Setting                             | Meaning                                                   |
 | ----------------------------------- | --------------------------------------------------------- |
@@ -356,7 +356,6 @@ The settings are in the `CONFIG` section at the top. After changing any of them,
 | `BASE_RIGHT_MS`, `BASE_LEFT_MS`     | Time for a 90° turn (default; `base-tune` saves measured ones on the board) |
 | `BASE_DIRECTION`                    | Flip to -1 if right and left are swapped                  |
 | `BASE_LIMIT_DEG`                    | Base limit either side of centre (90). Do not raise it.   |
-| `MODE`                              | What runs when the file is started directly (see below)   |
 
 ### Python API
 
@@ -378,7 +377,6 @@ arm.calibrate_claw(False)            # "the claw is closed now"
 
 arm.turn_base(-45)                   # face 45° left
 arm.turn_base_by(30)                 # 30° further right
-arm.center_base()
 arm.set_base_angle(0)                # "the base is at centre now"
 arm.base_speed(40)                   # spin until stopped or the limit
 
@@ -394,20 +392,8 @@ arm.shutdown()
 Movement methods wait until the move is done. Pass `wait=False` to return straight away,
 then use `joints_moving()`, `claw_moving()`, `base_moving()` or the `wait_*()` methods.
 
-### Running it on the board without the PC
-
-```bash
-mpremote run cyberbrick_arm.py
-```
-
-This runs whatever `MODE` is set to:
-
-| `MODE`         | Does                                                         |
-| -------------- | ------------------------------------------------------------ |
-| `"demo"`       | Scripted demo of every part (default)                        |
-| `"rc"`         | Drive the arm from a paired CyberBrick remote                |
-| `"rc_monitor"` | Print raw remote values, to find which stick is which        |
-| `"none"`       | Set up the arm and hold it, for REPL use                     |
+To drive the arm with the remote's sticks, use `python arm_serial.py remote`; the demo
+is `python arm_serial.py demo`. The library has no standalone mode of its own.
 
 ## Position estimates
 
@@ -417,7 +403,7 @@ back to the arm after it restarts, so they survive a reboot.
 
 If the base was moved by hand or with the remote, centre it and run
 `python arm_serial.py base-set 0`. If the claw estimate is wrong, open or close it fully
-and run `claw-cal open` or `claw-cal closed`.
+and run `claw-set open` or `claw-set closed`.
 
 ## Tests
 

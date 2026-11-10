@@ -857,11 +857,11 @@ class RadioTest(unittest.TestCase):
         status = self.session.status()
         self.assertEqual((status["base_angle"], status["claw"]), (0, 0.0))
 
-    def test_demo_is_not_sent_to_the_board(self):
-        names = {getattr(n, "name", None)
-                 for n in arm_serial.library_tree(arm_serial.DEVICE_LIB).body}
-        self.assertNotIn("demo", names)
-        self.assertIn("CyberBrickArm", names)
+    def test_the_arm_library_has_no_standalone_code(self):
+        # The demo runs from the PC and the sticks go through 'remote'.
+        for name in ("demo", "run_rc", "rc_monitor", "main", "MODE"):
+            self.assertFalse(hasattr(cyberbrick_arm, name), name)
+        self.assertNotIn("center_base", arm_radio.METHODS)
 
     # --------------------------------------------------------------- updates
 
@@ -918,7 +918,7 @@ class UsbCodeTest(unittest.TestCase):
             ("claw", ("open",)): "arm.open_claw()",
             ("claw", ("0.5",)): "arm.set_claw(0.5)",
             ("claw-spin", ("40",)): "arm.claw_run(40.0, ignore_limits=True)",
-            ("claw-cal", ("open",)): "arm.calibrate_claw(True)",
+            ("claw-set", ("open",)): "arm.calibrate_claw(True)",
             ("turn", ("-45",)): "arm.turn_base(-45.0)",
             ("base", ("40", "1.5")): "arm.rotate_base(40.0, 1500)",
             ("base-set", ()): "arm.set_base_angle(0.0)",
@@ -929,7 +929,70 @@ class UsbCodeTest(unittest.TestCase):
             self.assertEqual(arm_serial.usb_code(call), code + arm_serial.STATUS, name)
         self.assertEqual(arm_serial.usb_code(arm_serial.cmd_status([])[0]),
                          "print(arm.status())")
-        self.assertIs(arm_serial.CALIBRATIONS["base-calibrate"], arm_serial.tune_base)
+
+    def test_old_names_still_work(self):
+        for old, new in arm_serial.ALIASES.items():
+            self.assertTrue(new in arm_serial.COMMANDS or new in arm_serial.SESSION_COMMANDS)
+            self.assertNotIn(old, arm_serial.COMMANDS)
+            self.assertNotIn(old, arm_serial.SESSION_COMMANDS)
+        seen = []
+        real = arm_serial._main
+        arm_serial._main = lambda opts: (seen.append(opts.command), (0, {}))[1]
+        try:
+            arm_serial.main(["claw-cal", "open"])
+            arm_serial.main(["base-calibrate"])
+        finally:
+            arm_serial._main = real
+        self.assertEqual(seen, ["claw-set", "base-tune"])
+
+
+class UsbLoadTest(unittest.TestCase):
+    """Over USB the arm library always runs from the copy saved on the board."""
+
+    class Link:
+        def __init__(self, installed):
+            self.installed = installed
+            self.code = []
+
+        def exec(self, code, timeout=30, echo=False):
+            self.code.append(code)
+            if "Pin(10" in code:
+                return "0\n"                      # a receiver
+            if "'arm' in globals()" in code:
+                return "False\n"
+            if "mem_free" in code:
+                return "40000 1\n"
+            if "open('/cyberbrick_arm.ver')" in code:
+                return self.installed + "\n"
+            if "json.dumps(arm.status())" in code:
+                return '{"lower_arm": 0, "upper_arm": 0, "claw": 0.0, ' \
+                       '"base_angle": 0, "base_speed": 0}\n'
+            return ""
+
+    def _load(self, installed):
+        link = self.Link(installed)
+        session = arm_serial.ArmSession(link)
+        saved = []
+        session._save_library = saved.append
+        real = arm_serial.STATE_FILE
+        arm_serial.STATE_FILE = os.path.join(tempfile.gettempdir(), "no-such-state.json")
+        try:
+            with contextlib.redirect_stdout(io.StringIO()):
+                session.load()
+        finally:
+            arm_serial.STATE_FILE = real
+        return link, saved
+
+    def test_saves_the_library_when_it_changed(self):
+        link, saved = self._load("-")
+        self.assertEqual(saved, [arm_serial.source_version()])
+        self.assertTrue(any("from cyberbrick_arm import CyberBrickArm" in c
+                            for c in link.code))
+
+    def test_uses_the_saved_copy_when_it_is_current(self):
+        link, saved = self._load(arm_serial.source_version())
+        self.assertEqual(saved, [])
+        self.assertTrue(any("arm = CyberBrickArm()" in c for c in link.code))
 
 
 class PortLockTest(unittest.TestCase):

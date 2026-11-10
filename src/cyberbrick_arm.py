@@ -13,20 +13,17 @@ Libraries used (CyberBrick firmware, docs at
 https://makerworld.com/en/cyberbrick/api-doc/cyberbrick_core/lib/index.html):
     bbl.servos.ServosController   its PWM pins (servos_map) / set_speed / stop
     bbl.motors.MotorsController   set_speed(-2048..2048) / stop
-    rc_module                     rc_slave_init / rc_slave_data (optional remote)
 
 How to run
 ----------
 From a PC (recommended), over the radio link or the USB serial port:
     python arm_serial.py demo               # see arm_serial.py for commands
 
-Over USB, arm_serial.py loads this file on the board and creates `arm` there.
-In radio mode, arm_radio.py starts it when the board boots.
+Over USB, arm_serial.py installs this file on the board (compiled) and
+creates `arm` there. In radio mode, arm_radio.py starts it when the board
+boots. To drive the arm with the remote's sticks, use `arm_serial.py remote`.
 
-Standalone on the board:
-    mpremote run cyberbrick_arm.py          # runs MODE below (default: demo)
-
-Or copy it to the board and use it from the REPL:
+From the board's REPL, once it is installed:
     >>> import cyberbrick_arm as ca
     >>> arm = ca.CyberBrickArm()
     >>> arm.move_lower_arm(120)
@@ -77,13 +74,6 @@ except KeyError:
 # =============================================================================
 # CONFIG
 # =============================================================================
-
-# What to do when the file is run directly:
-#   "demo"       run a scripted demo of every joint, the claw and the base
-#   "rc"         drive the arm from a paired CyberBrick transmitter
-#   "rc_monitor" print raw transmitter values (to find which stick is which)
-#   "none"       set up the arm and hold position (for REPL use)
-MODE = "demo"
 
 # Ports
 LOWER_ARM_SERVO = 1   # S1, 180 deg
@@ -149,23 +139,6 @@ SERVO_NS0 = 488281
 SERVO_NS_PER_DEG = 11068
 # Joint speed 1 is SERVO_DEG_S deg/s on average (the library's step rate).
 SERVO_DEG_S = 4.61
-
-# Remote control mapping: (channel index, direction). Channels in
-# rc_slave_data(): 0=L1 1=L2 2=L3 3=R1 4=R2 5=R3, 6..9 = K1..K4 buttons.
-# Use MODE = "rc_monitor" to see which channel each stick moves.
-RC_BASE = (0, 1)
-RC_LOWER_ARM = (1, 1)
-RC_UPPER_ARM = (4, 1)
-RC_CLAW = (3, 1)
-RC_BTN_HOME = 6         # K1: go to home pose
-RC_BTN_OPEN = 7         # K2: open claw fully
-RC_BTN_CLOSE = 8        # K3: close claw fully
-RC_BTN_STOP = 9         # K4: stop everything
-RC_CENTER = 2048        # stick centre (ADC 0..4095)
-RC_DEADZONE = 200
-RC_JOINT_RATE = 90      # deg/s at full stick deflection
-RC_BASE_MAX = 60        # base speed (%) at full stick deflection
-RC_LOOP_MS = 20
 
 # Calibration saved on the board by claw-calibrate / base-tune /
 # arm-calibrate. Values in this file replace the defaults above when the
@@ -506,14 +479,6 @@ class CyberBrickArm:
         if wait:
             self.wait_joints()
 
-    def jog_joint(self, servo, delta):
-        """Nudge a joint by `delta` (position units) at once (live control)."""
-        self._check_joint(servo)
-        lo, hi = self._position_range(servo)
-        position = _clamp(self.joint_angle(servo) + delta, lo, hi)
-        self._want[servo] = position
-        self._set_servo(servo, self._to_servo(servo, position))
-
     def move_lower_arm(self, angle, speed=JOINT_SPEED, wait=True):
         """Move the lower arm (S1)."""
         self.move_joint(LOWER_ARM_SERVO, angle, speed, wait)
@@ -640,9 +605,6 @@ class CyberBrickArm:
         The result is still kept within +-BASE_LIMIT_DEG of centre.
         """
         self.turn_base(self.base_angle() + float(degrees), wait)
-
-    def center_base(self, wait=True):
-        self.turn_base(0, wait)
 
     def base_speed(self, speed):
         """Spin the base at `speed` % (-100..100, positive = right) until
@@ -793,185 +755,3 @@ class CyberBrickArm:
             self.release_joints()
         else:
             self.hold_joints()
-
-
-# =============================================================================
-# Demo
-# =============================================================================
-
-def demo(arm):
-    """Exercise every joint, the claw and the base, then pick and place."""
-    lo = arm.home_position(LOWER_ARM_SERVO)
-    up = arm.home_position(UPPER_ARM_SERVO)
-    print("[demo] home")
-    arm.home()
-    time.sleep_ms(500)
-
-    print("[demo] claw open / close")
-    arm.open_claw()
-    time.sleep_ms(300)
-    arm.close_claw()
-    time.sleep_ms(300)
-
-    print("[demo] lower arm (S1) sweep")
-    arm.move_lower_arm(lo + 30)
-    arm.move_lower_arm(lo - 30)
-    arm.move_lower_arm(lo)
-
-    print("[demo] upper arm (S2) sweep")
-    arm.move_upper_arm(up + 30)
-    arm.move_upper_arm(up - 30)
-    arm.move_upper_arm(up)
-
-    print("[demo] base (M2) left / right")
-    arm.turn_base(45)
-    time.sleep_ms(300)
-    arm.turn_base(-45)
-    time.sleep_ms(300)
-    arm.turn_base(0)
-
-    print("[demo] pick and place")
-    arm.open_claw()
-    arm.move_arm(lower=lo + 35, upper=up - 25)   # reach
-    arm.close_claw()                             # grab
-    arm.move_arm(lower=lo, upper=up)             # lift
-    arm.turn_base(60)                            # turn
-    arm.move_arm(lower=lo + 35, upper=up - 25)   # lower
-    arm.open_claw()                              # drop
-    arm.move_arm(lower=lo, upper=up)             # lift
-    arm.turn_base(0)                             # turn back
-    arm.close_claw()
-
-    print("[demo] done:", arm.status())
-
-
-# =============================================================================
-# Remote control (CyberBrick transmitter)
-# =============================================================================
-
-def _stick(raw, direction):
-    """Convert an ADC value (0..4095) to -1.0..1.0 with a dead zone."""
-    d = raw - RC_CENTER
-    if -RC_DEADZONE <= d <= RC_DEADZONE:
-        return 0.0
-    if d > 0:
-        v = (d - RC_DEADZONE) / (4095 - RC_CENTER - RC_DEADZONE)
-    else:
-        v = (d + RC_DEADZONE) / (RC_CENTER - RC_DEADZONE)
-    return _clamp(v, -1.0, 1.0) * direction
-
-
-def run_rc(arm):
-    """Drive the arm live from a paired CyberBrick transmitter."""
-    import rc_module
-
-    if rc_module.rc_slave_init() is False:
-        print("[rc] receiver init failed")
-        return
-
-    print("[rc] sticks: base, lower arm, upper arm, claw")
-    print("[rc] K1 home | K2 open claw | K3 close claw | K4 stop all")
-    print("[rc] Ctrl-C to quit")
-
-    prev_buttons = [1, 1, 1, 1]
-    link = None
-    claw_by_stick = False
-    last = time.ticks_ms()
-
-    while True:
-        now = time.ticks_ms()
-        dt = time.ticks_diff(now, last) / 1000
-        last = now
-
-        data = rc_module.rc_slave_data()
-        if not data or not any(data):
-            if link is not False:
-                print("[rc] no transmitter data, waiting...")
-                arm.base_stop()
-                arm.claw_stop()
-                claw_by_stick = False
-                link = False
-            time.sleep_ms(RC_LOOP_MS)
-            continue
-        if link is not True:
-            print("[rc] transmitter connected")
-            link = True
-
-        # Base
-        speed = round(_stick(data[RC_BASE[0]], RC_BASE[1]) * RC_BASE_MAX)
-        if speed != arm._base_applied:
-            arm.base_speed(speed)
-
-        # Joints (stick sets the rate of movement)
-        for servo, (ch, direction) in ((LOWER_ARM_SERVO, RC_LOWER_ARM),
-                                       (UPPER_ARM_SERVO, RC_UPPER_ARM)):
-            v = _stick(data[ch], direction)
-            if v:
-                arm.jog_joint(servo, v * RC_JOINT_RATE * dt)
-
-        # Claw
-        v = _stick(data[RC_CLAW[0]], RC_CLAW[1])
-        if v:
-            arm.claw_run(v * CLAW_SPEED)
-            claw_by_stick = True
-        elif claw_by_stick:
-            arm.claw_stop()
-            claw_by_stick = False
-
-        # Buttons (0 = pressed), act on press
-        buttons = list(data[6:10])
-        for idx in range(4):
-            if buttons[idx] == 0 and prev_buttons[idx] != 0:
-                ch = idx + 6
-                if ch == RC_BTN_HOME:
-                    arm.home(wait=False)
-                elif ch == RC_BTN_OPEN:
-                    arm.open_claw(wait=False)
-                elif ch == RC_BTN_CLOSE:
-                    arm.close_claw(wait=False)
-                elif ch == RC_BTN_STOP:
-                    arm.stop_all()
-        prev_buttons = buttons
-
-        time.sleep_ms(RC_LOOP_MS)
-
-
-def rc_monitor():
-    """Print raw transmitter data so you can map sticks to channels."""
-    import rc_module
-
-    if rc_module.rc_slave_init() is False:
-        print("[rc] receiver init failed")
-        return
-    print("[rc] L1 L2 L3 R1 R2 R3 K1 K2 K3 K4  (Ctrl-C to quit)")
-    while True:
-        print(rc_module.rc_slave_data())
-        time.sleep_ms(200)
-
-
-# =============================================================================
-# Entry point
-# =============================================================================
-
-def main(mode=MODE):
-    arm = CyberBrickArm()
-    try:
-        if mode == "demo":
-            demo(arm)
-        elif mode == "rc":
-            run_rc(arm)
-        elif mode == "rc_monitor":
-            rc_monitor()
-        else:
-            print("[arm] ready:", arm.status())
-            return arm
-    except KeyboardInterrupt:
-        print("[arm] interrupted")
-    finally:
-        if mode in ("demo", "rc", "rc_monitor"):
-            arm.shutdown()
-    return arm
-
-
-if __name__ == "__main__":
-    main()

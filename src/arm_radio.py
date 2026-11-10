@@ -60,7 +60,6 @@ METHODS = {
     "close_claw": (CLAW, CLAW),
     "turn_base": (BASE, BASE),
     "turn_base_by": (BASE, BASE),
-    "center_base": (BASE, BASE),
     "rotate_base": (BASE, BASE),
     "claw_run": (0, CLAW),
     "claw_stop": (0, CLAW),

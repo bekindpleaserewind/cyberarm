@@ -25,7 +25,7 @@ Setup
     pip install -r requirements.txt           # pyserial, mpy-cross
     python arm_serial.py radio-pair           # USB in the remote
     python arm_serial.py radio-install        # USB in the arm, once
-    (or, USB only: python arm_serial.py install)
+    (USB only needs no setup: commands install the arm library themselves)
 
 Examples
 --------
@@ -384,30 +384,13 @@ def source_version(path=DEVICE_LIB):
         return hashlib.sha256(f.read()).hexdigest()[:16]
 
 
-def _is_serial_only(node):
-    """True for top-level code only needed when the library runs standalone
-    with the handheld remote (run_rc, RC_* settings, MODE, main)."""
-    if isinstance(node, ast.If):                      # if __name__ == "__main__"
-        return True
-    if isinstance(node, ast.FunctionDef):
-        return node.name in SKIP_FUNCTIONS
-    if isinstance(node, ast.Assign):
-        names = [getattr(t, "id", "") for t in node.targets]
-        return any(n == "MODE" or n.startswith("RC_") for n in names)
-    return False
-
-
-def library_tree(path):
-    """The board library as needed over serial: no docstrings, no remote code."""
-    with open(path, encoding="utf-8") as f:
-        tree = ast.parse(f.read())
-    _strip_docstrings(tree)
-    tree.body = [n for n in tree.body if not _is_serial_only(n)]
-    return tree
-
-
 def compile_library(board_mpy):
-    """Compile the board library to .mpy bytecode for a board.
+    """Compile the board library to .mpy bytecode for a board."""
+    return compile_file(DEVICE_LIB, board_mpy)
+
+
+def compile_file(path, board_mpy):
+    """Compile a board file to .mpy bytecode, without docstrings.
 
     The board loads .mpy files without compiling them, which needs far less
     RAM than importing a .py file. -O3 leaves out line numbers to make the
@@ -415,11 +398,6 @@ def compile_library(board_mpy):
     `board_mpy` is sys.implementation._mpy from the board; the compiled file
     must use the same .mpy version.
     """
-    return compile_source(ast.unparse(library_tree(DEVICE_LIB)), DEVICE_LIB, board_mpy)
-
-
-def compile_file(path, board_mpy):
-    """Compile another board file (radio, bridge, boot hook) to .mpy."""
     with open(path, encoding="utf-8") as f:
         tree = ast.parse(f.read())
     _strip_docstrings(tree)
@@ -457,11 +435,6 @@ def compile_source(source, path, board_mpy):
             "the board's MicroPython (1.23 -> pip install mpy-cross==1.23.0.post2).")
     return data
 
-
-# Board-library functions only used when it runs standalone (the demo and
-# the RC remote); not needed over serial, so they are not sent to the board.
-# The PC runs the demo itself, one command at a time (run_demo).
-SKIP_FUNCTIONS = {"demo", "_stick", "run_rc", "rc_monitor", "main"}
 
 # The stock firmware already has Bambu's bbl servo/motor library loaded, so
 # the arm library reuses it for free. If it is missing (board interrupted
@@ -543,52 +516,6 @@ def _strip_docstrings(tree):
                     and isinstance(body[0].value, ast.Constant)
                     and isinstance(body[0].value.value, str)):
                 node.body = body[1:] or [ast.Pass()]
-
-
-def _code(node):
-    """Source for one statement, without comments, indented one space per level."""
-    lines = ast.unparse(node).splitlines()
-    out = []
-    for line in lines:
-        stripped = line.lstrip(" ")
-        out.append(" " * ((len(line) - len(stripped)) // 4) + stripped)
-    return "\n".join(out)
-
-
-def board_chunks(path, max_chars=1500):
-    """Split the board library into small pieces to run one after another.
-
-    The board compiles each piece separately, so peak RAM use depends on the
-    largest piece rather than the whole file. Classes are sent as an empty
-    class followed by one method at a time.
-    """
-    pieces = []
-    for node in library_tree(path).body:
-        if isinstance(node, ast.ClassDef):
-            methods = [n for n in node.body
-                       if isinstance(n, ast.FunctionDef) and not n.decorator_list]
-            others = [n for n in node.body if n not in methods] or [ast.Pass()]
-            shell_class = ast.ClassDef(
-                name=node.name, bases=node.bases, keywords=node.keywords,
-                body=others, decorator_list=node.decorator_list)
-            if "type_params" in ast.ClassDef._fields:   # Python 3.12+
-                shell_class.type_params = []
-            pieces.append(_code(shell_class))
-            for m in methods:
-                pieces.append(f"{_code(m)}\n{node.name}.{m.name} = {m.name}\n"
-                              f"del {m.name}")
-            continue
-        pieces.append(_code(node))
-
-    chunks, current = [], ""
-    for piece in pieces:
-        if current and len(current) + len(piece) > max_chars:
-            chunks.append(current)
-            current = ""
-        current += piece + "\n"
-    if current:
-        chunks.append(current)
-    return chunks
 
 
 # -----------------------------------------------------------------------------
@@ -752,8 +679,8 @@ class ArmSession:
     def load(self, force=False):
         """Make `arm` available on the board.
 
-        Uses the copy installed in flash when it matches the local
-        cyberbrick_arm.py; otherwise uploads the library into RAM.
+        Runs the compiled copy saved in the board's flash, and saves a new
+        one first whenever the local cyberbrick_arm.py has changed.
         """
         self.check_receiver()
         version = source_version()
@@ -764,27 +691,11 @@ class ArmSession:
             print("The arm library running on the board is not your local "
                   "cyberbrick_arm.py; reloading it.")
         self._prepare()
-
-        installed = self.installed_version()
-        if installed == version:
-            print("Using the arm library installed on the board.")
-            self.link.exec(f"import sys\nsys.modules.pop({INSTALL_MODULE!r}, None)\n"
-                           f"from {INSTALL_MODULE} import CyberBrickArm",
-                           timeout=15)
-        else:
-            if installed:
-                print("The arm library on the board is older than your local "
-                      "cyberbrick_arm.py.\nRun 'install' to update it. "
-                      "Uploading to RAM for now.")
-            else:
-                print("Tip: run 'install' once to save the arm library on the "
-                      "board for faster, more reliable starts.")
-            chunks = board_chunks(DEVICE_LIB)
-            size = sum(len(c) for c in chunks)
-            print(f"Uploading {os.path.basename(DEVICE_LIB)} "
-                  f"({size} bytes in {len(chunks)} pieces)...")
-            for chunk in chunks:
-                self.link.exec(chunk, timeout=15)
+        if self.installed_version() != version:
+            print("Your cyberbrick_arm.py has changed; saving it on the board.")
+            self._save_library(version)
+        self.link.exec(f"import sys\nsys.modules.pop({INSTALL_MODULE!r}, None)\n"
+                       f"from {INSTALL_MODULE} import CyberBrickArm", timeout=15)
 
         # Create the arm. This homes S1/S2 and stops S3 and M2. _arm_ver says
         # which cyberbrick_arm.py it came from, so a stale one gets replaced.
@@ -882,16 +793,20 @@ class ArmSession:
     # ---------------------------------------------------------------- install
 
     def install(self, quiet=False):
-        """Compile cyberbrick_arm.py and save it in the board's flash.
+        """Compile cyberbrick_arm.py and save it in the board's flash now.
 
-        Only adds files; boot.py and the stock firmware are not changed, so
-        the receiver still starts in its normal remote-control mode.
+        USB commands also do this by themselves whenever the local file has
+        changed. Only adds files; boot.py and the stock firmware are not
+        changed, so the receiver still starts in its normal remote-control mode.
         """
         self.check_receiver()
-        data = compile_library(self.board_mpy())
-        version = source_version()
-
         self._prepare()
+        self._save_library(source_version())
+        if not quiet:
+            print("The receiver still boots into its normal remote-control mode.")
+
+    def _save_library(self, version):
+        data = compile_library(self.board_mpy())
         self.remove_files(INSTALL_VERSION)
         self.write_file(INSTALL_PATH, data)
 
@@ -908,8 +823,6 @@ class ArmSession:
                        f" _vf.write({version!r})\n"
                        "del _vf")
         print(f"Installed {INSTALL_PATH} (version {version}).")
-        if not quiet:
-            print("The receiver still boots into its normal remote-control mode.")
 
     def install_radio(self, pair):
         """The one-time USB install for radio mode on the arm's receiver.
@@ -966,23 +879,16 @@ class ArmSession:
     # --------------------------------------------------------------- commands
 
     def run(self, code, timeout=60):
-        """Run arm code on the board, streaming its output. Ctrl-C stops the arm."""
-        try:
-            out = self.link.exec(code, timeout=timeout, echo=True)
-            if out and not out.endswith("\n"):
-                print()
-            return out
-        except KeyboardInterrupt:
-            print("\nInterrupted, stopping the arm...")
-            if self.link.interrupt():
-                self.link.exec("arm.stop_all()")
-                self.save_state()
-            raise
+        """Run arm code on the board, streaming its output."""
+        out = self.link.exec(code, timeout=timeout, echo=True)
+        if out and not out.endswith("\n"):
+            print()
+        return out
 
     def run_call(self, call, timeout):
         if call.method == "demo":
             return _stop_on_ctrl_c(self, run_demo)
-        return self.run(usb_code(call), timeout)
+        return _stop_on_ctrl_c(self, lambda s: s.run(usb_code(call), timeout))
 
     def call(self, method, *args, timeout=60, **kwargs):
         """Call one arm method and return its result (moves wait to finish)."""
@@ -1281,8 +1187,8 @@ def _stop_on_ctrl_c(session, job):
 def run_demo(session):
     """Exercise every joint, the claw and the base, then pick and place.
 
-    The same steps as demo() in cyberbrick_arm.py, sent one command at a time
-    (over USB or the radio), so the arm itself does not need the demo code.
+    Sent one command at a time (over USB or the radio), so the arm itself
+    does not need any demo code.
     """
     lo, up = home_positions(get_calibration(session, ARM_KEYS))
     reach = ("move_arm", lo + 35, up - 25)
@@ -1465,10 +1371,10 @@ def cmd_claw_spin(a):
     return _call("claw_run", speed, ignore_limits=True), 10
 
 
-def cmd_claw_cal(a):
-    _need(a, 1, "claw-cal open|closed   (tell the arm the claw's current state)")
+def cmd_claw_set(a):
+    _need(a, 1, "claw-set open|closed   (tell the arm the claw's current state)")
     if a[0] not in ("open", "closed", "close"):
-        raise UsageError("claw-cal takes 'open' or 'closed'")
+        raise UsageError("claw-set takes 'open' or 'closed'")
     return _call("calibrate_claw", a[0] == "open"), 10
 
 
@@ -1523,7 +1429,7 @@ COMMANDS = {
     "move":      (cmd_move,      "move LOWER UPPER [SPEED]     both joints together"),
     "claw":      (cmd_claw,      "claw open|close|0.0-1.0      S3 claw"),
     "claw-spin": (cmd_claw_spin, "claw-spin SPEED              spin S3 freely (0 stops)"),
-    "claw-cal":  (cmd_claw_cal,  "claw-cal open|closed         set claw's known state"),
+    "claw-set":  (cmd_claw_set,  "claw-set open|closed         tell the arm the claw's state"),
     "turn":      (cmd_turn,      "turn ANGLE                   base to -90 (left)..90 (right)"),
     "turn-by":   (cmd_turn_by,   "turn-by DEGREES              base relative turn (- = left)"),
     "base-set":  (cmd_base_set,  "base-set [ANGLE]             tell the arm the base angle (0)"),
@@ -1537,11 +1443,10 @@ COMMANDS = {
 SESSION_COMMANDS = {
     "shell": "shell                        interactive prompt",
     "reset": "reset                        reboot the arm (USB: into stock firmware)",
-    "install":   "install                      save arm library on the board (USB)",
+    "install":   "install                      USB: save the arm library now (done anyway when it changed)",
     "uninstall": "uninstall                    remove it and radio mode from the board (USB)",
     "claw-calibrate": "claw-calibrate               time a full claw open and close and save them",
     "base-tune": "base-tune                    set 90 deg base turns by how far timed turns go",
-    "base-calibrate": "base-calibrate               same as base-tune",
     "arm-calibrate": "arm-calibrate                set each joint's home and fully extended position",
     "arm-align": "arm-align                    re-seat a joint on its servo so it can use the full 0-180",
     "gesture":   "gesture wave|nod|shake [TIMES] [SPEED]  smooth gesture, then back to the start pose",
@@ -1553,6 +1458,8 @@ SESSION_COMMANDS = {
     "update":    "update [--force]             radio: send changed board code to the arm",
     "remote":    "remote                       radio: hand the arm to the stick remote",
 }
+# Old command names that still work.
+ALIASES = {"claw-cal": "claw-set", "base-calibrate": "base-tune"}
 USB_ONLY = {"install", "uninstall", "probe", "radio-pair", "radio-install"}
 RADIO_ONLY = {"ping", "update", "remote"}
 CALIBRATIONS = {}   # filled in below: name -> function(session)
@@ -1973,7 +1880,6 @@ def align_joint(session):
 
 CALIBRATIONS["claw-calibrate"] = calibrate_claw
 CALIBRATIONS["base-tune"] = tune_base
-CALIBRATIONS["base-calibrate"] = tune_base      # the old name
 CALIBRATIONS["arm-calibrate"] = calibrate_arm
 CALIBRATIONS["arm-align"] = align_joint
 
@@ -2074,6 +1980,7 @@ def shell(session):
             continue
         try:
             parts = shlex.split(line)
+            parts[0] = ALIASES.get(parts[0], parts[0])
             if parts[0] in CALIBRATIONS:
                 CALIBRATIONS[parts[0]](session)
             elif parts[0] == "gesture":
@@ -2114,6 +2021,7 @@ def main(argv=None):
     parser.add_argument("command", nargs="?", default="help")
     parser.add_argument("args", nargs=argparse.REMAINDER)
     opts = parser.parse_args(argv)
+    opts.command = ALIASES.get(opts.command, opts.command)
 
     if not opts.json:
         code, _ = _main(opts)

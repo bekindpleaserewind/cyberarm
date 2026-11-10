@@ -36,7 +36,7 @@ The base angle is estimated from timing, so it can drift.
 Timing is off. The user should run `arm_serial.py claw-calibrate` (interactive): it closes
 the claw, then times a full open and a full close while they press Enter at the moment the
 claw stops moving. If the claw estimate is just out of sync, put it in a known state and
-tell the arm: `arm_serial.py claw-cal closed` (or `claw-cal open`).
+tell the arm: `arm_serial.py claw-set closed` (or `claw-set open`).
 
 ## A joint hits the table, the base or the arm, or its direction is unknown
 
