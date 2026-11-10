@@ -38,14 +38,14 @@ board library itself (`BASE_LIMIT_DEG` in `src/cyberbrick_arm.py`).
    python arm_serial.py radio-pair       # USB in the CyberBrick remote
    python arm_serial.py radio-install    # USB in the arm's receiver, once; then unplug it
    python arm_serial.py arm-calibrate    # joint home and fully extended positions (needed once)
-   python arm_serial.py base-calibrate   # time 90° turns (needed once)
+   python arm_serial.py base-tune        # set 90° turns (needed once)
    ```
 
    For USB control instead, run `python arm_serial.py install` with USB in the arm.
 
-   `base-calibrate` is interactive: centre the base, then press Enter when it has turned
-   a quarter turn and again when it is back at centre. Until this is done, the base uses a
-   guessed timing and its 90° may not be a real 90°.
+   `base-tune` is interactive: centre the base, and the arm makes timed turns while you
+   say how far each one went (for example `70`) until it turns exactly 90°. Until this is
+   done, the base uses a guessed timing and its 90° may not be a real 90°.
 
 2. Install the plugin:
 

@@ -110,7 +110,7 @@ Tested on Linux (WSL, `/dev/ttyACM0`).
 If you built a different CyberBrick arm, or wired it differently, change the port numbers
 and joint limits in the `CONFIG` section of
 [src/cyberbrick_arm.py](src/cyberbrick_arm.py). Then send it to the arm with
-`arm_serial.py update` (radio) or `arm_serial.py install` (USB).
+`arm_serial.py update` (radio). Over USB, the next command installs it by itself.
 
 ## Quick start
 
@@ -158,9 +158,9 @@ the remote and the arm are separate USB devices, so attach whichever one is plug
 
 From now on every command goes over the radio automatically.
 
-> **Prefer a cable?** Skip this step and run `python arm_serial.py install` with USB in
-> the arm. Commands then go over USB, and the stock stick remote still works when the
-> arm is not plugged in.
+> **Prefer a cable?** Skip this step and plug USB into the arm. Commands then go over
+> USB (the first one saves the arm library on the arm), and the stock stick remote still
+> works when the arm is not plugged in.
 
 ### 3. Calibrate (once)
 
@@ -169,10 +169,14 @@ the arm, so they survive restarts and updates.
 
 ```bash
 python arm_serial.py arm-calibrate     # required: each joint's home and fully extended position
-python arm_serial.py base-calibrate    # required: times 90° base turns (the defaults are placeholders)
+python arm_serial.py base-tune         # required: sets 90° base turns (the defaults are placeholders)
 python arm_serial.py claw-calibrate    # recommended: times a full claw open and close
 python arm_serial.py calibration       # show what the arm is using
 ```
+
+`base-tune` needs no stopwatch: the arm times each turn itself and you say how far the
+base went (for example `70`), until a turn is exactly 90°. Mark straight ahead and 90°
+on the table first. (`base-calibrate` is the old name and now runs `base-tune`.)
 
 `arm-calibrate` moves the joints from the keyboard (`+`, `-`, `+20`, or a servo angle),
 not by hand: while the battery is on, the servos hold their position firmly.
@@ -193,7 +197,8 @@ python arm_serial.py gesture wave
 python arm_serial.py home
 ```
 
-See [Commands](#commands) for the full list, and [src/README.md](src/README.md) for the
+See [Commands](#commands) for an overview, and [src/README.md](src/README.md) for every
+command, the
 calibration steps, radio details, the measured RAM and flash budget, the Python API and
 troubleshooting.
 
@@ -227,87 +232,22 @@ See [openclaw-plugin/README.md](openclaw-plugin/README.md) for the tool list and
 
 ## Commands
 
-Usage: `python arm_serial.py [OPTIONS] COMMAND [ARGS]`. `python arm_serial.py help` lists
-them all. Joint positions run from 0 (home, folded) to 180 (fully extended). `SPEED` is
-1-100 (default 20, about 90°/s; 100 jumps straight there).
+Usage: `python arm_serial.py [OPTIONS] COMMAND [ARGS]`, and `python arm_serial.py help`
+lists them all. Joint positions run from 0 (home, folded) to 180 (fully extended).
+`SPEED` is 1-100 (default 20, about 90°/s).
 
-### Options
+| For | Commands |
+| --- | -------- |
+| Joints | `home`, `lower POS`, `upper POS`, `move LOWER UPPER`, `gesture wave\|nod\|shake`, `release` |
+| Claw | `claw open\|close\|0.0-1.0`, `claw-spin SPEED`, `claw-set open\|closed` |
+| Base | `turn ANGLE`, `turn-by DEGREES`, `base SPEED [SECONDS]`, `base-set [ANGLE]` |
+| Everyday | `status`, `stop`, `demo`, `shell` |
+| Calibration | `arm-calibrate`, `arm-align`, `base-tune`, `claw-calibrate`, `calibration` |
+| Wireless | `radio-pair`, `radio-install`, `ping`, `update`, `remote` |
+| Board | `reset`, `install`, `uninstall`, `probe`, `raw CODE` |
 
-| Option | Does |
-| ------ | ---- |
-| `--transport auto\|radio\|usb` | `auto` (default) uses the radio once `radio-install` has been run, otherwise USB. Also `CYBERBRICK_TRANSPORT`. |
-| `--port PORT` | Serial port, e.g. `/dev/ttyACM0` or `COM5`: the remote's for radio commands, the arm's for USB. Found by MAC if not given. Also `CYBERBRICK_REMOTE_PORT` (remote) and `CYBERBRICK_PORT` (arm). |
-| `--json` | Print one JSON object (`ok`, `before`, `status`, `output`, `error`) for other programs; progress goes to stderr |
-| `--reload` | Reload the arm library on the board even if it is already running (USB) |
-| `--baud N` | Serial speed (default 115200) |
-| `-v`, `--verbose` | Print serial connection details, for troubleshooting |
-
-### Joints
-
-| Command | Does |
-| ------- | ---- |
-| `home [SPEED]` | Fold both joints to position 0 and centre the base |
-| `lower POS [SPEED]` | Move the lower arm (S1) |
-| `upper POS [SPEED]` | Move the upper arm (S2) |
-| `move LOWER UPPER [SPEED]` | Move both joints together |
-| `gesture wave\|nod\|shake [TIMES] [SPEED]` | One smooth gesture (raises the arm first if needed), then back to the starting pose |
-| `release` | Let S1 and S2 go limp (the arm may drop) |
-
-### Claw
-
-| Command | Does |
-| ------- | ---- |
-| `claw open\|close\|0.0-1.0` | Open, close, or open part way (0.5 = half open) |
-| `claw-spin SPEED` | Spin the claw servo freely, -100..100 (0 stops) |
-| `claw-cal open\|closed` | Tell the arm the claw is fully open or closed right now |
-
-### Base
-
-| Command | Does |
-| ------- | ---- |
-| `turn ANGLE` | Face an angle, -90 (left) .. 90 (right); 0 = straight ahead |
-| `turn-by DEGREES` | Turn from where it is (negative = left), still within ±90° |
-| `base SPEED [SECONDS]` | Spin the base motor (stops at ±90°; over the radio a run without SECONDS stops after 20 s) |
-| `base-set [ANGLE]` | Tell the arm which way the base faces now (default 0); use after moving it by hand |
-
-### Everyday
-
-| Command | Does |
-| ------- | ---- |
-| `status` | Print joint positions, claw opening and base angle |
-| `stop` | Stop the base and claw, hold the joints where they are |
-| `demo` | Run through every joint, the claw and the base |
-| `shell` | Interactive `arm>` prompt for the same commands |
-
-### Calibration
-
-| Command | Does |
-| ------- | ---- |
-| `arm-calibrate` | Set each joint's home and fully extended position, and which way it moves |
-| `arm-align` | Re-seat a joint on its servo so home is at the servo's end, then calibrate |
-| `base-calibrate` | Time 90° base turns and check which way is right |
-| `claw-calibrate` | Time a full claw open and close |
-| `calibration` | Show every calibration value the arm uses |
-
-### Wireless
-
-| Command | Does |
-| ------- | ---- |
-| `radio-pair [CHANNEL]` | USB in the remote: make the link keys and set the remote up as the radio bridge |
-| `radio-install` | USB in the arm, once: install radio mode and reboot into it (safe to run again) |
-| `ping` | Check the link: reply time, signal strength, the arm's free RAM |
-| `update [--force]` | Send changed `cyberbrick_arm.py` / `arm_radio.py` to the arm over the radio |
-| `remote` | Hand the arm to the stick remote until it is switched off and on |
-
-### Board
-
-| Command | Does |
-| ------- | ---- |
-| `reset` | Restart the arm (into radio mode if it was installed, otherwise the stock firmware) |
-| `install` | USB: save the arm library in the arm's flash (for USB control) |
-| `uninstall` | USB: remove the arm library and radio mode from the arm |
-| `probe` | USB: report free RAM and flash, boot files and radio support (read-only) |
-| `raw CODE` | USB only: run MicroPython on the arm, e.g. `raw "print(arm.status())"` |
+Every command and option is described in
+[src/README.md](src/README.md#arm_serialpy).
 
 ## Agent tools
 

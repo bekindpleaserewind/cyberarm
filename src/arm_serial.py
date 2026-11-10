@@ -25,7 +25,7 @@ Setup
     pip install -r requirements.txt           # pyserial, mpy-cross
     python arm_serial.py radio-pair           # USB in the remote
     python arm_serial.py radio-install        # USB in the arm, once
-    (or, USB only: python arm_serial.py install)
+    (USB only needs no setup: commands install the arm library themselves)
 
 Examples
 --------
@@ -83,6 +83,7 @@ BAUD = 115200
 ESP32_C3_USB = (0x303A, 0x1001)
 
 RAW_BANNER = b"raw REPL; CTRL-B to exit\r\n>"
+PORT_WAIT_S = 120      # wait this long for another command to free the port
 CHUNK_BYTES = 256      # write size when sending code to the board
 WRITE_BYTES = 512      # file bytes per step when installing
 
@@ -229,10 +230,7 @@ class CyberBrickSerial:
             return False
 
         print(f"Connecting to {self.port}...")
-        try:
-            self.serial = serial.Serial(self.port, self.baud, timeout=0.1)
-        except (serial.SerialException, OSError) as e:
-            print(f"Connection failed: {e}")
+        if not self._open():
             return False
 
         if self.enter_raw_repl():
@@ -246,6 +244,34 @@ class CyberBrickSerial:
 
         print("Could not reach the MicroPython REPL on", self.port)
         return False
+
+    def _open(self):
+        """Open the port for this process only.
+
+        Two programs on one board break each other: each one's Ctrl-C stops
+        what the other is running. So the port is locked, and a second
+        arm_serial.py (say a CLI command while the OpenClaw gateway is busy)
+        waits for the first to finish instead.
+        """
+        deadline = time.monotonic() + PORT_WAIT_S
+        waiting = False
+        while True:
+            try:
+                self.serial = serial.Serial(self.port, self.baud, timeout=0.1,
+                                            exclusive=True)
+                return True
+            except (serial.SerialException, OSError) as e:
+                text = str(e)
+                busy = any(s in text for s in ("exclusively lock", "Access is denied",
+                                               "busy", "Resource temporarily"))
+                if not busy or time.monotonic() > deadline:
+                    print(f"Connection failed: {e}")
+                    return False
+                if not waiting:
+                    print(f"{self.port} is in use by another program (another "
+                          "arm_serial.py command or the OpenClaw gateway); waiting...")
+                    waiting = True
+                time.sleep(0.5)
 
     def _hard_reset(self):
         """Toggle DTR/RTS to reboot the board (same sequence as CyberClaw)."""
@@ -358,30 +384,13 @@ def source_version(path=DEVICE_LIB):
         return hashlib.sha256(f.read()).hexdigest()[:16]
 
 
-def _is_serial_only(node):
-    """True for top-level code only needed when the library runs standalone
-    with the handheld remote (run_rc, RC_* settings, MODE, main)."""
-    if isinstance(node, ast.If):                      # if __name__ == "__main__"
-        return True
-    if isinstance(node, ast.FunctionDef):
-        return node.name in SKIP_FUNCTIONS
-    if isinstance(node, ast.Assign):
-        names = [getattr(t, "id", "") for t in node.targets]
-        return any(n == "MODE" or n.startswith("RC_") for n in names)
-    return False
-
-
-def library_tree(path):
-    """The board library as needed over serial: no docstrings, no remote code."""
-    with open(path, encoding="utf-8") as f:
-        tree = ast.parse(f.read())
-    _strip_docstrings(tree)
-    tree.body = [n for n in tree.body if not _is_serial_only(n)]
-    return tree
-
-
 def compile_library(board_mpy):
-    """Compile the board library to .mpy bytecode for a board.
+    """Compile the board library to .mpy bytecode for a board."""
+    return compile_file(DEVICE_LIB, board_mpy)
+
+
+def compile_file(path, board_mpy):
+    """Compile a board file to .mpy bytecode, without docstrings.
 
     The board loads .mpy files without compiling them, which needs far less
     RAM than importing a .py file. -O3 leaves out line numbers to make the
@@ -389,11 +398,6 @@ def compile_library(board_mpy):
     `board_mpy` is sys.implementation._mpy from the board; the compiled file
     must use the same .mpy version.
     """
-    return compile_source(ast.unparse(library_tree(DEVICE_LIB)), DEVICE_LIB, board_mpy)
-
-
-def compile_file(path, board_mpy):
-    """Compile another board file (radio, bridge, boot hook) to .mpy."""
     with open(path, encoding="utf-8") as f:
         tree = ast.parse(f.read())
     _strip_docstrings(tree)
@@ -431,10 +435,6 @@ def compile_source(source, path, board_mpy):
             "the board's MicroPython (1.23 -> pip install mpy-cross==1.23.0.post2).")
     return data
 
-
-# Board-library functions only used when it runs standalone with the RC
-# remote; not needed over serial, so they are not sent to the board.
-SKIP_FUNCTIONS = {"_stick", "run_rc", "rc_monitor", "main"}
 
 # The stock firmware already has Bambu's bbl servo/motor library loaded, so
 # the arm library reuses it for free. If it is missing (board interrupted
@@ -516,52 +516,6 @@ def _strip_docstrings(tree):
                     and isinstance(body[0].value, ast.Constant)
                     and isinstance(body[0].value.value, str)):
                 node.body = body[1:] or [ast.Pass()]
-
-
-def _code(node):
-    """Source for one statement, without comments, indented one space per level."""
-    lines = ast.unparse(node).splitlines()
-    out = []
-    for line in lines:
-        stripped = line.lstrip(" ")
-        out.append(" " * ((len(line) - len(stripped)) // 4) + stripped)
-    return "\n".join(out)
-
-
-def board_chunks(path, max_chars=1500):
-    """Split the board library into small pieces to run one after another.
-
-    The board compiles each piece separately, so peak RAM use depends on the
-    largest piece rather than the whole file. Classes are sent as an empty
-    class followed by one method at a time.
-    """
-    pieces = []
-    for node in library_tree(path).body:
-        if isinstance(node, ast.ClassDef):
-            methods = [n for n in node.body
-                       if isinstance(n, ast.FunctionDef) and not n.decorator_list]
-            others = [n for n in node.body if n not in methods] or [ast.Pass()]
-            shell_class = ast.ClassDef(
-                name=node.name, bases=node.bases, keywords=node.keywords,
-                body=others, decorator_list=node.decorator_list)
-            if "type_params" in ast.ClassDef._fields:   # Python 3.12+
-                shell_class.type_params = []
-            pieces.append(_code(shell_class))
-            for m in methods:
-                pieces.append(f"{_code(m)}\n{node.name}.{m.name} = {m.name}\n"
-                              f"del {m.name}")
-            continue
-        pieces.append(_code(node))
-
-    chunks, current = [], ""
-    for piece in pieces:
-        if current and len(current) + len(piece) > max_chars:
-            chunks.append(current)
-            current = ""
-        current += piece + "\n"
-    if current:
-        chunks.append(current)
-    return chunks
 
 
 # -----------------------------------------------------------------------------
@@ -725,8 +679,8 @@ class ArmSession:
     def load(self, force=False):
         """Make `arm` available on the board.
 
-        Uses the copy installed in flash when it matches the local
-        cyberbrick_arm.py; otherwise uploads the library into RAM.
+        Runs the compiled copy saved in the board's flash, and saves a new
+        one first whenever the local cyberbrick_arm.py has changed.
         """
         self.check_receiver()
         version = source_version()
@@ -737,27 +691,11 @@ class ArmSession:
             print("The arm library running on the board is not your local "
                   "cyberbrick_arm.py; reloading it.")
         self._prepare()
-
-        installed = self.installed_version()
-        if installed == version:
-            print("Using the arm library installed on the board.")
-            self.link.exec(f"import sys\nsys.modules.pop({INSTALL_MODULE!r}, None)\n"
-                           f"from {INSTALL_MODULE} import CyberBrickArm, demo",
-                           timeout=15)
-        else:
-            if installed:
-                print("The arm library on the board is older than your local "
-                      "cyberbrick_arm.py.\nRun 'install' to update it. "
-                      "Uploading to RAM for now.")
-            else:
-                print("Tip: run 'install' once to save the arm library on the "
-                      "board for faster, more reliable starts.")
-            chunks = board_chunks(DEVICE_LIB)
-            size = sum(len(c) for c in chunks)
-            print(f"Uploading {os.path.basename(DEVICE_LIB)} "
-                  f"({size} bytes in {len(chunks)} pieces)...")
-            for chunk in chunks:
-                self.link.exec(chunk, timeout=15)
+        if self.installed_version() != version:
+            print("Your cyberbrick_arm.py has changed; saving it on the board.")
+            self._save_library(version)
+        self.link.exec(f"import sys\nsys.modules.pop({INSTALL_MODULE!r}, None)\n"
+                       f"from {INSTALL_MODULE} import CyberBrickArm", timeout=15)
 
         # Create the arm. This homes S1/S2 and stops S3 and M2. _arm_ver says
         # which cyberbrick_arm.py it came from, so a stale one gets replaced.
@@ -855,16 +793,20 @@ class ArmSession:
     # ---------------------------------------------------------------- install
 
     def install(self, quiet=False):
-        """Compile cyberbrick_arm.py and save it in the board's flash.
+        """Compile cyberbrick_arm.py and save it in the board's flash now.
 
-        Only adds files; boot.py and the stock firmware are not changed, so
-        the receiver still starts in its normal remote-control mode.
+        USB commands also do this by themselves whenever the local file has
+        changed. Only adds files; boot.py and the stock firmware are not
+        changed, so the receiver still starts in its normal remote-control mode.
         """
         self.check_receiver()
-        data = compile_library(self.board_mpy())
-        version = source_version()
-
         self._prepare()
+        self._save_library(source_version())
+        if not quiet:
+            print("The receiver still boots into its normal remote-control mode.")
+
+    def _save_library(self, version):
+        data = compile_library(self.board_mpy())
         self.remove_files(INSTALL_VERSION)
         self.write_file(INSTALL_PATH, data)
 
@@ -881,8 +823,6 @@ class ArmSession:
                        f" _vf.write({version!r})\n"
                        "del _vf")
         print(f"Installed {INSTALL_PATH} (version {version}).")
-        if not quiet:
-            print("The receiver still boots into its normal remote-control mode.")
 
     def install_radio(self, pair):
         """The one-time USB install for radio mode on the arm's receiver.
@@ -939,21 +879,16 @@ class ArmSession:
     # --------------------------------------------------------------- commands
 
     def run(self, code, timeout=60):
-        """Run arm code on the board, streaming its output. Ctrl-C stops the arm."""
-        try:
-            out = self.link.exec(code, timeout=timeout, echo=True)
-            if out and not out.endswith("\n"):
-                print()
-            return out
-        except KeyboardInterrupt:
-            print("\nInterrupted, stopping the arm...")
-            if self.link.interrupt():
-                self.link.exec("arm.stop_all()")
-                self.save_state()
-            raise
+        """Run arm code on the board, streaming its output."""
+        out = self.link.exec(code, timeout=timeout, echo=True)
+        if out and not out.endswith("\n"):
+            print()
+        return out
 
     def run_call(self, call, timeout):
-        return self.run(usb_code(call), timeout)
+        if call.method == "demo":
+            return _stop_on_ctrl_c(self, run_demo)
+        return _stop_on_ctrl_c(self, lambda s: s.run(usb_code(call), timeout))
 
     def call(self, method, *args, timeout=60, **kwargs):
         """Call one arm method and return its result (moves wait to finish)."""
@@ -994,9 +929,23 @@ class RadioSession:
                 "or use --transport usb to drive the arm over its own USB.")
 
     def _reboot_remote(self):
-        """Reboot the remote and reconnect once it is back."""
+        """Restart the remote and reconnect once it is back.
+
+        The USB reset lines restart the whole chip, radio included.
+        machine.reset() does not always free a jammed radio (seen on the
+        remote after a soft reset), so it is only the fallback for when the
+        lines do nothing."""
+        self.link.exec("_rr = 1")           # gone once the board restarted
+        if self.link._hard_reset():
+            self.link.close()
+            self._reconnect()
+            if self.link.exec("print('_rr' in globals())").strip() == "False":
+                return
         self.link.send_and_reboot()
         self.link.close()
+        self._reconnect()
+
+    def _reconnect(self):
         deadline = time.monotonic() + 15
         time.sleep(2)
         while time.monotonic() < deadline:
@@ -1011,13 +960,14 @@ class RadioSession:
         """Start the bridge on the remote, rebooting it into bridge mode if the
         stock firmware (which owns the radio) is running."""
         state = self.link.exec(
-            "import sys, os\n"
+            "import sys, os, machine\n"
             "try:\n"
             f" os.stat({BRIDGE_PATH!r})\n"
             " _i = 1\n"
             "except OSError:\n"
             " _i = 0\n"
-            "print(_i, int('rc_module' in sys.modules))\n"
+            "print(_i, int('rc_module' in sys.modules),\n"
+            "      int(machine.reset_cause() == machine.SOFT_RESET))\n"
             "del _i").split()
         if state[0] != "1":
             raise UsageError("The bridge is not installed on this remote. Run "
@@ -1026,13 +976,23 @@ class RadioSession:
             print("Switching the remote to bridge mode (it reboots once)...")
             self.link.exec(f"with open({MODE_FILE!r}, 'w') as _f:\n _f.write('bridge')")
             self._reboot_remote()
+        elif state[2] == "1":
+            # After a soft reset (Ctrl-D, mpremote, Thonny) Wi-Fi still says
+            # it is on, but nothing the remote sends goes out: every request
+            # would fail with "no reply from the arm". A real restart fixes it.
+            print("The remote was soft-reset, which leaves its radio unable to "
+                  "send; restarting it...")
+            self._reboot_remote()
+        self._start_bridge()
+
+    def _start_bridge(self):
         p = self.pair
         self.link.exec(f"import arm_bridge\n_b = arm_bridge.get({p['arm_mac']!r}, "
                        f"{p['pmk']!r}, {p['lmk']!r}, {p['channel']!r})", timeout=15)
 
     # ------------------------------------------------------------- the link
 
-    def request(self, body, timeout_s=10):
+    def request(self, body, timeout_s=10, retry=True):
         """Send one request to the arm; returns (status, result)."""
         text = json.dumps(body)[1:]          # the bridge adds "[seq, "
         try:
@@ -1040,10 +1000,24 @@ class RadioSession:
                 f"print(_b.call({text!r}, {int(timeout_s * 1000) + 3000}))",
                 timeout=timeout_s + 15)
         except DeviceError as e:
-            raise RadioError(
-                f"{str(e).splitlines()[-1]}.\nIs the arm switched on and in radio "
-                "mode (it boots into it)? After 'remote' it stays in stick mode "
-                "until it is switched off and on again.")
+            error = str(e).splitlines()[-1]
+            if "no radio contact" not in error:
+                raise RadioError(
+                    f"{error}.\nThe arm's radio hears the remote, but radio mode is "
+                    "not answering. After 'remote' it stays in stick mode until it "
+                    "is switched off and on again; otherwise switch it off and on.")
+            if not retry:
+                raise RadioError(
+                    "no radio contact with the arm, even after restarting the "
+                    "remote.\nIs the arm switched on? Move the remote closer.")
+            # Not one message reached the arm, so it never saw this request
+            # and sending it again is safe. Most often the remote's own radio
+            # is jammed, and only restarting its chip frees it.
+            print("No radio contact with the arm; restarting the remote's radio "
+                  "and trying again...")
+            self._reboot_remote()
+            self._start_bridge()
+            return self.request(body, timeout_s, retry=False)
         reply = json.loads(out.strip().splitlines()[-1])
         if reply[1] == "E":
             raise DeviceError(reply[2])
@@ -1086,6 +1060,10 @@ class RadioSession:
         status = self.ping()
         self._restore_state(status)
         print("Arm ready:", _public(self.last_status))
+        if status.get("code"):
+            print(f"Warning: the arm is running backup copies ({status['code']}) "
+                  "because radio mode did not start with the current files.\n"
+                  "Switch the arm off and on; if this stays, run 'update --force'.")
 
     def arm_loaded(self):
         return True
@@ -1124,50 +1102,14 @@ class RadioSession:
         if call.method == "raw":
             raise UsageError("'raw' runs code on the board, so it only works over "
                              "USB (--transport usb with USB in the arm).")
-        try:
-            if call.method == "demo":
-                return self._demo()
-            if call.method == "status":
-                status = self.ping()
-            else:
-                status = self.request(["c", call.method, list(call.args),
-                                       call.kwargs, timeout], timeout)[0]
-        except KeyboardInterrupt:
-            print("\nInterrupted, stopping the arm...")
-            if self.link.interrupt():
-                self.request(["c", "stop_all", [], {}, 10])
-                self.save_state()
-            raise
+        if call.method == "demo":
+            return _stop_on_ctrl_c(self, run_demo)
+        if call.method == "status":
+            status = _stop_on_ctrl_c(self, lambda s: s.ping())
+        else:
+            status = _stop_on_ctrl_c(self, lambda s: s.request(
+                ["c", call.method, list(call.args), call.kwargs, timeout], timeout)[0])
         text = repr(_public(status))
-        print(text)
-        return text + "\n"
-
-    def _demo(self):
-        """The board library's demo(), run one step at a time over the radio."""
-        lo, up = home_positions(get_calibration(self, ARM_KEYS))
-        reach = ("move_arm", lo + 35, up - 25)
-        rest = ("move_arm", lo, up)
-        steps = [
-            "home", ("home",), 0.5,
-            "claw open / close", ("open_claw",), 0.3, ("close_claw",), 0.3,
-            "lower arm (S1) sweep", ("move_lower_arm", lo + 30),
-            ("move_lower_arm", lo - 30), ("move_lower_arm", lo),
-            "upper arm (S2) sweep", ("move_upper_arm", up + 30),
-            ("move_upper_arm", up - 30), ("move_upper_arm", up),
-            "base (M2) left / right", ("turn_base", 45), 0.3, ("turn_base", -45), 0.3,
-            ("turn_base", 0),
-            "pick and place", ("open_claw",), reach, ("close_claw",), rest,
-            ("turn_base", 60), reach, ("open_claw",), rest, ("turn_base", 0),
-            ("close_claw",),
-        ]
-        for step in steps:
-            if isinstance(step, str):
-                print("[demo]", step)
-            elif isinstance(step, float):
-                time.sleep(step)
-            else:
-                self.call(step[0], *step[1:])
-        text = f"[demo] done: {_public(self.last_status)}"
         print(text)
         return text + "\n"
 
@@ -1222,16 +1164,75 @@ class RadioSession:
               f"signal {rssi} dBm.")
         print(f"Arm free RAM: {status.get('mem', 0) // 1024} KB, boot id "
               f"{status.get('boot')}, versions {versions}.")
+        print("Last restart:", RESET_CAUSES.get(status.get("rst"), "unknown"))
         if status.get("radio_error"):
             print("Last radio error on the arm:", status["radio_error"])
+        if status.get("timer_error"):
+            print("Timer error on the arm:", status["timer_error"])
         print("Status:", _public(status))
+
+
+def _stop_on_ctrl_c(session, job):
+    """Run job(session); on Ctrl-C, stop the arm before passing it on."""
+    try:
+        return job(session)
+    except KeyboardInterrupt:
+        print("\nInterrupted, stopping the arm...")
+        if session.link.interrupt():
+            session.call("stop_all", timeout=10)
+            session.save_state()
+        raise
+
+
+def run_demo(session):
+    """Exercise every joint, the claw and the base, then pick and place.
+
+    Sent one command at a time (over USB or the radio), so the arm itself
+    does not need any demo code.
+    """
+    lo, up = home_positions(get_calibration(session, ARM_KEYS))
+    reach = ("move_arm", lo + 35, up - 25)
+    rest = ("move_arm", lo, up)
+    steps = [
+        "home", ("home",), 0.5,
+        "claw open / close", ("open_claw",), 0.3, ("close_claw",), 0.3,
+        "lower arm (S1) sweep", ("move_lower_arm", lo + 30),
+        ("move_lower_arm", lo - 30), ("move_lower_arm", lo),
+        "upper arm (S2) sweep", ("move_upper_arm", up + 30),
+        ("move_upper_arm", up - 30), ("move_upper_arm", up),
+        "base (M2) left / right", ("turn_base", 45), 0.3, ("turn_base", -45), 0.3,
+        ("turn_base", 0),
+        "pick and place", ("open_claw",), reach, ("close_claw",), rest,
+        ("turn_base", 60), reach, ("open_claw",), rest, ("turn_base", 0),
+        ("close_claw",),
+    ]
+    for step in steps:
+        if isinstance(step, str):
+            print("[demo]", step)
+        elif isinstance(step, float):
+            time.sleep(step)
+        else:
+            session.call(step[0], *step[1:])
+    text = f"[demo] done: {_public(session.status())}"
+    print(text)
+    return text + "\n"
+
+
+# machine.reset_cause() on the ESP32-C3, as reported by the arm.
+RESET_CAUSES = {
+    1: "switched on (or the battery voltage dipped)",
+    2: "restarted by a command or an update, or the code crashed",
+    3: "watchdog: the arm froze and restarted itself",
+    5: "soft reset",
+}
 
 
 def _public(status):
     """status() without the radio-only fields, same shape as over USB."""
     if not status:
         return status
-    return {k: v for k, v in status.items() if k not in ("boot", "mem", "radio_error")}
+    return {k: v for k, v in status.items()
+            if k not in ("boot", "mem", "radio_error", "rst", "code")}
 
 
 def radio_pair(link, pair, channel=None):
@@ -1312,8 +1313,6 @@ def usb_code(call):
     """The MicroPython code that runs a command over USB."""
     if call.method == "status":
         return "print(arm.status())"
-    if call.method == "demo":
-        return "demo(arm)"
     if call.method == "raw":
         return call.args[0]
     return "arm." + _params(call.method, call.args, call.kwargs) + STATUS
@@ -1372,10 +1371,10 @@ def cmd_claw_spin(a):
     return _call("claw_run", speed, ignore_limits=True), 10
 
 
-def cmd_claw_cal(a):
-    _need(a, 1, "claw-cal open|closed   (tell the arm the claw's current state)")
+def cmd_claw_set(a):
+    _need(a, 1, "claw-set open|closed   (tell the arm the claw's current state)")
     if a[0] not in ("open", "closed", "close"):
-        raise UsageError("claw-cal takes 'open' or 'closed'")
+        raise UsageError("claw-set takes 'open' or 'closed'")
     return _call("calibrate_claw", a[0] == "open"), 10
 
 
@@ -1430,7 +1429,7 @@ COMMANDS = {
     "move":      (cmd_move,      "move LOWER UPPER [SPEED]     both joints together"),
     "claw":      (cmd_claw,      "claw open|close|0.0-1.0      S3 claw"),
     "claw-spin": (cmd_claw_spin, "claw-spin SPEED              spin S3 freely (0 stops)"),
-    "claw-cal":  (cmd_claw_cal,  "claw-cal open|closed         set claw's known state"),
+    "claw-set":  (cmd_claw_set,  "claw-set open|closed         tell the arm the claw's state"),
     "turn":      (cmd_turn,      "turn ANGLE                   base to -90 (left)..90 (right)"),
     "turn-by":   (cmd_turn_by,   "turn-by DEGREES              base relative turn (- = left)"),
     "base-set":  (cmd_base_set,  "base-set [ANGLE]             tell the arm the base angle (0)"),
@@ -1444,10 +1443,10 @@ COMMANDS = {
 SESSION_COMMANDS = {
     "shell": "shell                        interactive prompt",
     "reset": "reset                        reboot the arm (USB: into stock firmware)",
-    "install":   "install                      save arm library on the board (USB)",
+    "install":   "install                      USB: save the arm library now (done anyway when it changed)",
     "uninstall": "uninstall                    remove it and radio mode from the board (USB)",
     "claw-calibrate": "claw-calibrate               time a full claw open and close and save them",
-    "base-calibrate": "base-calibrate               time 90 deg base turns and save them",
+    "base-tune": "base-tune                    set 90 deg base turns by how far timed turns go",
     "arm-calibrate": "arm-calibrate                set each joint's home and fully extended position",
     "arm-align": "arm-align                    re-seat a joint on its servo so it can use the full 0-180",
     "gesture":   "gesture wave|nod|shake [TIMES] [SPEED]  smooth gesture, then back to the start pose",
@@ -1459,6 +1458,8 @@ SESSION_COMMANDS = {
     "update":    "update [--force]             radio: send changed board code to the arm",
     "remote":    "remote                       radio: hand the arm to the stick remote",
 }
+# Old command names that still work.
+ALIASES = {"claw-cal": "claw-set", "base-calibrate": "base-tune"}
 USB_ONLY = {"install", "uninstall", "probe", "radio-pair", "radio-install"}
 RADIO_ONLY = {"ping", "update", "remote"}
 CALIBRATIONS = {}   # filled in below: name -> function(session)
@@ -1524,74 +1525,143 @@ def calibrate_claw(session):
     print("The claw is closed and the arm knows it.")
 
 
-def calibrate_base(session):
-    """Time 90 degree base turns and save BASE_RIGHT_MS / BASE_LEFT_MS.
+def _end_base_calibration(session):
+    """Stop the base and put its 90 degree limit back on after base-tune
+    ends early: Ctrl-C (perhaps in the middle of a radio call,
+    which leaves the remote busy) or a lost link. Never raises."""
+    try:
+        session.link.interrupt()
+    except Exception:
+        pass
+    try:
+        session.call("base_stop", timeout=5)
+        session.call("set_base_limit", True, timeout=5)
+    except Exception as e:
+        print(f"Could not put the base's 90 deg limit back on ({e}).\n"
+              "Switch the arm off and on before using the base.")
 
-    The base motor has no position sensor, so its angle is worked out from
-    how long it has turned. This also checks which way is right and fixes
-    BASE_DIRECTION if needed. The 90 degree limit is off while it runs.
+
+NUDGE_MS = 250      # one base nudge (l or r) while centring
+
+
+def _nudge_base(session, speed, heading):
+    """Let the user nudge the base with l / r until it faces straight ahead.
+
+    "rrr" nudges three times as far in one go. Returns on an empty answer.
+    """
+    while True:
+        key = input(heading + "   type l or r then Enter to nudge (rrr = 3 nudges), "
+                    "or just Enter when centred: ").strip().lower()
+        heading = ""
+        if not key:
+            return
+        if key[0] in "lr" and key == key[0] * len(key):
+            sign = -1 if key[0] == "l" else 1
+            ms = NUDGE_MS * len(key)
+            session.call("rotate_base", sign * speed, ms, timeout=ms / 1000 + 10)
+        else:
+            print("   Type l or r (or several, like rrr), or just Enter.")
+
+
+def _ask_degrees(prompt):
+    """How far the user says the base turned: degrees, or None when it was a
+    quarter turn (Enter, "ok", or 89-91: nobody judges finer than that)."""
+    while True:
+        text = input(prompt).strip().lower()
+        if text in ("", "ok", "y", "yes", "done"):
+            return None
+        try:
+            degrees = float(text.rstrip("°").removesuffix("deg").strip())
+        except ValueError:
+            print("   Type how many degrees it turned, e.g. 75, or 90 (or just Enter) "
+                  "if it was a quarter turn.")
+            continue
+        if abs(degrees - 90) <= 1:
+            return None
+        if 10 <= degrees <= 270:
+            return degrees
+        print("   Give a number of degrees between 10 and 270.")
+
+
+def tune_base(session):
+    """Set BASE_RIGHT_MS / BASE_LEFT_MS from turns the arm times itself.
+
+    There is no stopwatch: the arm runs the motor for
+    an exact time on its own clock, the user says how far the base turned,
+    and the time is scaled to make that 90 degrees. Repeat until it is. The
+    turns stop the same way normal turns do, so the motor's start-up and
+    coasting are counted just as they are in use. Also checks which way is
+    right. The 90 degree limit is off while it runs.
     """
     speed = _source_constant("BASE_TURN_SPEED", 40)
-    direction = get_calibration(session, ["BASE_DIRECTION"])["BASE_DIRECTION"]
+    cal = get_calibration(session, ["BASE_RIGHT_MS", "BASE_DIRECTION"])
+    direction = cal["BASE_DIRECTION"]
+    right = None        # the motor sign that turns the base right, once known
 
-    def spin(sign):
-        session.call("base_speed", sign * speed, timeout=5)
+    def turn(sign, ms):
+        session.call("rotate_base", sign * speed, ms, timeout=ms / 1000 + 10)
 
-    def stop():
-        session.call("base_stop", timeout=5)
+    def tune(name, sign, ms):
+        """Turn `name` from centre for ms, ask how far it went, scale, repeat."""
+        nonlocal right
+        while True:
+            _nudge_base(session, speed, "Nudge the base until it faces straight ahead:\n")
+            print(f"   Turning {name} for {ms} ms...")
+            turn(sign, ms)
+            went_left = False
+            if right is None:
+                while True:
+                    way = input("   Which way did it turn, [r]ight or [l]eft? (as seen "
+                                "from behind the arm) ").strip().lower()[:1]
+                    if way in ("r", "l"):
+                        break
+                right = 1 if way == "r" else -1
+                went_left = right == -1
+            degrees = _ask_degrees("   How many degrees did it turn? (90 or just Enter "
+                                   "if it was a quarter turn: that finishes) ")
+            turn(-sign, ms)                     # back towards centre
+            if went_left:
+                # Left and right were swapped; check it again turning right.
+                print("   Left and right are swapped on this arm; fixed. "
+                      "Next turn goes right.")
+                sign = right
+                if degrees is None:
+                    continue
+            elif degrees is None:
+                return ms
+            new = round(ms * 90 / degrees)
+            if new == ms:
+                return ms
+            if not 100 <= new <= 60000:
+                print(f"   That would make 90 deg {new} ms, which can't be right; "
+                      f"trying {ms} ms again.")
+                continue
+            print(f"   {degrees:g} deg in {ms} ms, so 90 deg should take about "
+                  f"{new} ms. Let's check.")
+            ms = new
 
-    session.call("set_base_limit", False, timeout=5)   # no limit while calibrating
-    print("Base calibration. Watch the arm and press Enter at each step.")
+    session.call("set_base_limit", False, timeout=5)   # no limit while tuning
+    print("Base tuning. The arm times each turn itself; you just say how far it went.\n"
+          "Tip: mark straight ahead and 90 deg right and left on the table first.")
+    finished = False
     try:
-        while True:
-            key = input("1) Nudge the base until the arm faces straight ahead:\n"
-                        "   type l or r then Enter to nudge, or just Enter when "
-                        "centred: ").strip().lower()
-            if not key:
-                break
-            if key[0] in "lr":
-                sign = -1 if key[0] == "l" else 1
-                session.call("rotate_base", sign * speed, 250, timeout=10)
-
-        _wait_enter("2) Press Enter to start turning (this is timed)...")
-        spin(1)
-        t0 = time.monotonic()
-        t1 = _wait_enter("   Press Enter the moment the arm has turned a quarter "
-                         "turn (90 deg).")
-        stop()
-        first_ms = int((t1 - t0) * 1000)
-
-        while True:
-            way = input("   Which way did it turn, [r]ight or [l]eft? "
-                        "(as seen from behind the arm) ").strip().lower()
-            if way[:1] in ("r", "l"):
-                break
-
-        _wait_enter("3) Press Enter to turn back to centre (this is timed)...")
-        spin(-1)
-        t0 = time.monotonic()
-        t1 = _wait_enter("   Press Enter the moment it faces straight ahead again.")
-        stop()
-        back_ms = int((t1 - t0) * 1000)
+        right_ms = tune("right", 1, cal["BASE_RIGHT_MS"])
+        same = input(f"Right turns are set: 90 deg = {right_ms} ms. Use the same time "
+                     "for left turns? [Y/n] ").strip().lower()[:1] != "n"
+        left_ms = right_ms if same else tune("left", -right, right_ms)
+        _nudge_base(session, speed, "Last step: nudge the base to straight ahead.\n")
+        finished = True
     except (KeyboardInterrupt, EOFError):
-        stop()
-        session.call("set_base_limit", True, timeout=5)
-        print("\nCalibration cancelled; nothing saved.")
+        print("\nTuning cancelled; nothing saved. Centre the base and run "
+              "'base-set 0'.")
+    finally:
+        if not finished:
+            _end_base_calibration(session)
+    if not finished:
         return
 
-    if way[0] == "r":
-        right_ms, left_ms = first_ms, back_ms
-    else:
-        # Positive speed turned it left: swap the direction and the timings.
-        direction = -direction
-        right_ms, left_ms = back_ms, first_ms
-    print(f"90 deg right took {right_ms} ms, 90 deg left took {left_ms} ms.")
-    if min(right_ms, left_ms) < 200:
-        session.call("set_base_limit", True, timeout=5)
-        session.call("set_base_angle", 0, timeout=5)
-        session.save_state()
-        print("That is too short to be right; nothing saved.")
-        return
+    if right == -1:
+        direction = -direction     # positive speed turned it left
     saved = session.call("save_calibration",
                          {"BASE_RIGHT_MS": right_ms, "BASE_LEFT_MS": left_ms,
                           "BASE_DIRECTION": direction}, timeout=10)
@@ -1599,7 +1669,7 @@ def calibrate_base(session):
     session.save_state()
     print("Saved on the arm: " + ", ".join(
         f"{k} = {saved[k]}" for k in ("BASE_RIGHT_MS", "BASE_LEFT_MS", "BASE_DIRECTION")) + ".")
-    print("The base is centred and the arm knows it.")
+    print("The base is centred and the arm knows it. Try 'turn 90' and 'turn -90'.")
 
 
 # Joint calibration: (key prefix, name, arm method, question after a move
@@ -1809,7 +1879,7 @@ def align_joint(session):
 
 
 CALIBRATIONS["claw-calibrate"] = calibrate_claw
-CALIBRATIONS["base-calibrate"] = calibrate_base
+CALIBRATIONS["base-tune"] = tune_base
 CALIBRATIONS["arm-calibrate"] = calibrate_arm
 CALIBRATIONS["arm-align"] = align_joint
 
@@ -1910,6 +1980,7 @@ def shell(session):
             continue
         try:
             parts = shlex.split(line)
+            parts[0] = ALIASES.get(parts[0], parts[0])
             if parts[0] in CALIBRATIONS:
                 CALIBRATIONS[parts[0]](session)
             elif parts[0] == "gesture":
@@ -1950,6 +2021,7 @@ def main(argv=None):
     parser.add_argument("command", nargs="?", default="help")
     parser.add_argument("args", nargs=argparse.REMAINDER)
     opts = parser.parse_args(argv)
+    opts.command = ALIASES.get(opts.command, opts.command)
 
     if not opts.json:
         code, _ = _main(opts)

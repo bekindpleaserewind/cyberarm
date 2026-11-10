@@ -97,6 +97,9 @@ class Pin:
 machine = types.ModuleType("machine")
 machine.Timer, machine.Pin = Timer, Pin
 machine.reset = lambda: (_ for _ in ()).throw(SystemExit("machine.reset"))
+machine.PWRON_RESET, machine.HARD_RESET, machine.WDT_RESET = 1, 2, 3
+machine.SOFT_RESET = 5
+machine.reset_cause = lambda: machine.HARD_RESET
 sys.modules["machine"] = machine
 
 
@@ -116,6 +119,7 @@ class ServosController:
                                  "step": 1.0} for _ in range(4)]
         self.servos_map = [PWM() for _ in range(4)]
         self.speeds = [0] * 4
+        self.proc_calls = 0
 
     def set_angle(self, i, angle):
         self.servos_info_map[i - 1].update(c_ang=float(angle), s_ang=float(angle),
@@ -128,6 +132,7 @@ class ServosController:
         self.servos_info_map[i - 1].update(s_ang=float(angle), step_en=True)
 
     def timing_proc(self):
+        self.proc_calls += 1
         for m in self.servos_info_map:
             if m["step_en"]:
                 d = m["s_ang"] - m["c_ang"]
@@ -305,6 +310,15 @@ class RadioTest(unittest.TestCase):
         self.link.ns["_b"] = arm_bridge.Bridge(PAIR["arm_mac"], PAIR["pmk"],
                                                PAIR["lmk"], PAIR["channel"])
         self.session = arm_serial.RadioSession(self.link, dict(PAIR))
+        self.remote_restarts = 0
+
+        def restart_remote():
+            self.remote_restarts += 1
+            for hook in self.on_remote_restart:
+                hook()
+        self.on_remote_restart = []
+        self.session._reboot_remote = restart_remote
+        self.session._start_bridge = lambda: None
 
     def tearDown(self):
         self.arm.shutdown()
@@ -401,15 +415,78 @@ class RadioTest(unittest.TestCase):
         self.assertEqual(len(lost), 1)
         self.assertAlmostEqual(self.arm.claw_position(), 1.0, delta=0.01)
 
+    def _radio_outage(self, ms):
+        """Lose every message for the first `ms` of the next request."""
+        end = CLOCK.now + ms
+        AIR.drop = lambda sender, data: CLOCK.now < end
+
+    def test_a_burst_of_lost_messages_is_ridden_out(self):
+        # Interference can wipe out a couple of seconds of the channel.
+        self._radio_outage(3500)
+        self.assertEqual(self.session.ping()["boot"], 1234)
+
+    def test_a_long_outage_gives_a_radio_error_after_about_5_s(self):
+        # The arm's radio acknowledged the messages (they were lost after
+        # that), so it is not the remote's fault: no restart, no resend.
+        self._radio_outage(60000)
+        start = CLOCK.now
+        with self.assertRaises(arm_serial.RadioError) as cm:
+            self.session.ping()
+        self.assertAlmostEqual(CLOCK.now - start, arm_bridge.NO_REPLY_MS, delta=400)
+        self.assertIn("no reply from the arm", str(cm.exception))
+        self.assertEqual(self.remote_restarts, 0)
+
+    def test_a_jammed_remote_radio_is_restarted_and_the_request_resent(self):
+        bridge = self.link.ns["_b"]
+        real_send = bridge.e.send
+
+        def jammed(*args):
+            raise OSError(116)              # ETIMEDOUT, as seen on the remote
+        bridge.e.send = jammed
+        self.on_remote_restart.append(lambda: setattr(bridge.e, "send", real_send))
+        self.quiet(self.session.call, "turn_base_by", 10)
+        self.assertEqual(self.remote_restarts, 1)
+        self.assertEqual(self.calls.count("turn_base_by"), 1)   # run once only
+        self.assertAlmostEqual(self.arm.base_angle(), 10, delta=1)
+
+    def test_status_always_fits_in_one_message(self):
+        self.server.error = "OSError: " + "x" * 300
+        self.arm.timer_error = ValueError("y" * 300)
+        self.server.rst = 3
+        self.server.code = "radio_old+arm_old"
+        self.arm._base_pos = -10 ** 8            # silly numbers, long digits
+        self.assertEqual(self.session.ping()["rst"], 3)
+        status = self.session.last_status
+        self.assertEqual(status["code"], "radio_old+arm_old")   # kept over errors
+        self.assertNotIn("rst", arm_serial._public(status))
+        self.assertNotIn("code", arm_serial._public(status))
+        # With room to spare, a (shortened) error is reported too.
+        self.arm.timer_error = None
+        self.arm._base_pos = 0
+        self.assertEqual(self.session.ping()["radio_error"], ("OSError: " + "x" * 31))
+
+    def test_backup_copies_are_reported(self):
+        server = arm_radio.Server(self.arm, self.server.radio, 1, "cyberbrick_arm_old", 1)
+        self.assertEqual(server.code, "radio+arm_old")
+        self.assertIsNone(self.server.code)
+        self.server.code = server.code
+        self.session._check_remote = self.session._ensure_bridge = lambda: None
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            self.session.load()
+        self.assertIn("running backup copies", out.getvalue())
+
     def test_no_arm_gives_a_radio_error(self):
         del AIR.nodes[ARM_MAC]
-        with self.assertRaises(arm_serial.RadioError):
-            self.session.ping()
+        with self.assertRaises(arm_serial.RadioError) as cm:
+            self.quiet(self.session.ping)
+        self.assertIn("even after restarting the remote", str(cm.exception))
+        self.assertEqual(self.remote_restarts, 1)              # tried once
 
     def test_wrong_key_is_not_heard(self):
         self.server.radio.e.peers[REMOTE_MAC] = b"x" * 16
         with self.assertRaises(arm_serial.RadioError):
-            self.session.ping()
+            self.quiet(self.session.ping)
 
     def test_messages_from_other_boards_are_ignored(self):
         AIR.next_mac = b"\xcc" * 6
@@ -568,6 +645,121 @@ class RadioTest(unittest.TestCase):
                          (0, 180, 180))
         self.assertEqual(self.arm.servo_angle(2), 180)
 
+    # ------------------------------------------------------------ base tuning
+
+    def _record_base_turns(self):
+        turns = []
+        real = self.arm.rotate_base
+        self.arm.rotate_base = lambda *a, **kw: (turns.append(a), real(*a, **kw))[1]
+        return turns
+
+    def _base_cal(self):
+        return arm_serial.get_calibration(
+            self.session, ["BASE_RIGHT_MS", "BASE_LEFT_MS", "BASE_DIRECTION"])
+
+    def test_base_tune_scales_the_turn_until_it_is_90(self):
+        turns = self._record_base_turns()
+        out = self._run_arm_calibrate([
+            "rr", "",       # centre: one double nudge right
+            "r", "45",      # turned right, only 45 deg -> twice as long
+            "", "",         # centre; exactly 90 now
+            "",             # same time for left turns
+            "",             # final centre
+        ], step=arm_serial.tune_base)
+        self.assertEqual(turns, [(40, 500), (40, 2000), (-40, 2000),
+                                 (40, 4000), (-40, 4000)])
+        self.assertEqual(self._base_cal(), {"BASE_RIGHT_MS": 4000, "BASE_LEFT_MS": 4000,
+                                            "BASE_DIRECTION": 1})
+        self.assertIn("90 deg should take about 4000 ms", out)
+        self.assertEqual(self.session.status()["base_angle"], 0)
+        self.assertEqual(self.arm._base_lim, 4000)          # 90 deg limit back on
+        self.assertEqual(self.arm.motors.speeds, [0, 0])
+
+    def test_base_tune_fixes_swapped_direction_and_tunes_left(self):
+        turns = self._record_base_turns()
+        self._run_arm_calibrate([
+            "", "l", "80",  # positive speed turned it LEFT, 80 deg
+            "", "",         # now turning right: exactly 90
+            "n",            # tune left separately
+            "", "100",      # left turn went 100 deg
+            "", "",         # exactly 90
+            "",             # final centre
+        ], step=arm_serial.tune_base)
+        self.assertEqual(turns, [(40, 2000), (-40, 2000),
+                                 (-40, 2250), (40, 2250),
+                                 (40, 2250), (-40, 2250),
+                                 (40, 2025), (-40, 2025)])
+        self.assertEqual(self._base_cal(), {"BASE_RIGHT_MS": 2250, "BASE_LEFT_MS": 2025,
+                                            "BASE_DIRECTION": -1})
+
+    def test_base_tune_cancel_saves_nothing(self):
+        answers = iter(["", "r"])
+
+        def fake_input(prompt=""):
+            try:
+                return next(answers)
+            except StopIteration:
+                raise EOFError
+        builtins = __builtins__ if isinstance(__builtins__, dict) else vars(__builtins__)
+        real_input, builtins["input"] = builtins["input"], fake_input
+        try:
+            self.quiet(arm_serial.tune_base, self.session)
+        finally:
+            builtins["input"] = real_input
+        self.assertFalse(os.path.exists(cyberbrick_arm.CAL_FILE))
+        self.assertEqual(self.arm._base_lim, 2000)          # limit back on
+        self.assertEqual(self.arm.motors.speeds, [0, 0])
+
+    def test_base_tune_finishes_when_told_90(self):
+        # Typing 90 (or close to it) must finish, not repeat the same turn.
+        turns = self._record_base_turns()
+        self._run_arm_calibrate([
+            "", "r", "75°",     # 75 deg -> 2400 ms
+            "", "90.5",         # close enough: done
+            "y",                # same time for left
+            "",
+        ], step=arm_serial.tune_base)
+        self.assertEqual(len(turns), 4)
+        self.assertEqual(self._base_cal()["BASE_RIGHT_MS"], 2400)
+        self._run_arm_calibrate(["", "r", "ok", "", ""], step=arm_serial.tune_base)
+        self.assertEqual(self._base_cal()["BASE_RIGHT_MS"], 2400)
+
+    def _fail_on_turn(self, n, error):
+        """Make the n-th rotate_base call from the PC raise `error`."""
+        real = self.session.call
+        count = [0]
+
+        def call(method, *args, **kw):
+            if method == "rotate_base":
+                count[0] += 1
+                if count[0] == n:
+                    real(method, *args, **kw)      # the arm starts the turn...
+                    raise error                    # ...then the PC loses it
+            return real(method, *args, **kw)
+        self.session.call = call
+
+    def test_base_tune_ctrl_c_during_a_turn_puts_the_limit_back(self):
+        self._fail_on_turn(1, KeyboardInterrupt())
+        self._run_arm_calibrate(["", "r"], step=arm_serial.tune_base)
+        self.assertEqual(self.arm._base_lim, 2000)
+        self.assertFalse(self.arm.base_moving())
+        self.assertFalse(os.path.exists(cyberbrick_arm.CAL_FILE))
+
+    def test_base_tune_lost_link_puts_the_limit_back(self):
+        self._fail_on_turn(2, arm_serial.RadioError("no reply from the arm"))
+        with self.assertRaises(arm_serial.RadioError):
+            self._run_arm_calibrate(["", "r", "45"], step=arm_serial.tune_base)
+        self.assertEqual(self.arm._base_lim, 2000)
+        self.assertFalse(self.arm.base_moving())
+
+    def test_base_tune_ignores_impossible_answers(self):
+        self._run_arm_calibrate([
+            "x", "",        # not a nudge: asked again
+            "r", "abc", "5", "",    # not a number, too small, then 90
+            "", "",
+        ], step=arm_serial.tune_base)
+        self.assertEqual(self._base_cal()["BASE_RIGHT_MS"], 2000)
+
     def test_wave_is_one_even_gesture_and_ends_where_it_started(self):
         self.session.call("move_arm", 10, 20, speed=100)
         self.calls.clear()
@@ -635,8 +827,41 @@ class RadioTest(unittest.TestCase):
         self.session.call("move_upper_arm", 180, speed=100)
         self.session.call("stop_all")                 # hold: no target to report
         self.assertEqual(self.arm.joint_angle(2), 180)
-        self.arm.servos.servos_info_map[1]["c_ang"] = 120  # e.g. half way there
+        self.arm._cd[2] = 12000                       # e.g. half way there
         self.assertAlmostEqual(self.arm.joint_angle(2), 45)
+
+    def test_timer_works_in_integers_only(self):
+        # The 10 ms timer must not make floats (each one is garbage on the
+        # board) and does not need the servo library's stepping.
+        pwm = self.arm.servos.servos_map[0]
+        pwm.history.clear()
+        self.arm.servos.proc_calls = 0
+        self.session.call("move_lower_arm", 37.3, speed=7)
+        self.session.call("set_claw", 0.5)
+        self.session.call("turn_base", 33)
+        self.assertGreater(len(pwm.history), 100)
+        self.assertTrue(all(type(ns) is int for ns in pwm.history))
+        self.assertTrue(all(type(cd) is int for cd in self.arm._cd.values()))
+        self.assertTrue(all(type(v) is int for v in (
+            self.arm._claw_pos, self.arm._base_pos, self.arm._claw_applied,
+            self.arm._base_applied)))
+        self.assertEqual(self.arm.servos.proc_calls, 0)
+        self.assertIsNone(self.arm.timer_error)
+        self.assertEqual(self.arm.servo_angle(1), 37)
+
+    def test_demo_runs_from_the_pc(self):
+        self.quiet(arm_serial.run_demo, self.session)
+        moves = [c for c in self.calls if c != "calibration"]
+        self.assertEqual(moves[:3], ["home", "open_claw", "close_claw"])
+        self.assertEqual(moves[-1], "close_claw")
+        status = self.session.status()
+        self.assertEqual((status["base_angle"], status["claw"]), (0, 0.0))
+
+    def test_the_arm_library_has_no_standalone_code(self):
+        # The demo runs from the PC and the sticks go through 'remote'.
+        for name in ("demo", "run_rc", "rc_monitor", "main", "MODE"):
+            self.assertFalse(hasattr(cyberbrick_arm, name), name)
+        self.assertNotIn("center_base", arm_radio.METHODS)
 
     # --------------------------------------------------------------- updates
 
@@ -693,7 +918,7 @@ class UsbCodeTest(unittest.TestCase):
             ("claw", ("open",)): "arm.open_claw()",
             ("claw", ("0.5",)): "arm.set_claw(0.5)",
             ("claw-spin", ("40",)): "arm.claw_run(40.0, ignore_limits=True)",
-            ("claw-cal", ("open",)): "arm.calibrate_claw(True)",
+            ("claw-set", ("open",)): "arm.calibrate_claw(True)",
             ("turn", ("-45",)): "arm.turn_base(-45.0)",
             ("base", ("40", "1.5")): "arm.rotate_base(40.0, 1500)",
             ("base-set", ()): "arm.set_base_angle(0.0)",
@@ -704,7 +929,106 @@ class UsbCodeTest(unittest.TestCase):
             self.assertEqual(arm_serial.usb_code(call), code + arm_serial.STATUS, name)
         self.assertEqual(arm_serial.usb_code(arm_serial.cmd_status([])[0]),
                          "print(arm.status())")
-        self.assertEqual(arm_serial.usb_code(arm_serial.cmd_demo([])[0]), "demo(arm)")
+
+    def test_old_names_still_work(self):
+        for old, new in arm_serial.ALIASES.items():
+            self.assertTrue(new in arm_serial.COMMANDS or new in arm_serial.SESSION_COMMANDS)
+            self.assertNotIn(old, arm_serial.COMMANDS)
+            self.assertNotIn(old, arm_serial.SESSION_COMMANDS)
+        seen = []
+        real = arm_serial._main
+        arm_serial._main = lambda opts: (seen.append(opts.command), (0, {}))[1]
+        try:
+            arm_serial.main(["claw-cal", "open"])
+            arm_serial.main(["base-calibrate"])
+        finally:
+            arm_serial._main = real
+        self.assertEqual(seen, ["claw-set", "base-tune"])
+
+
+class UsbLoadTest(unittest.TestCase):
+    """Over USB the arm library always runs from the copy saved on the board."""
+
+    class Link:
+        def __init__(self, installed):
+            self.installed = installed
+            self.code = []
+
+        def exec(self, code, timeout=30, echo=False):
+            self.code.append(code)
+            if "Pin(10" in code:
+                return "0\n"                      # a receiver
+            if "'arm' in globals()" in code:
+                return "False\n"
+            if "mem_free" in code:
+                return "40000 1\n"
+            if "open('/cyberbrick_arm.ver')" in code:
+                return self.installed + "\n"
+            if "json.dumps(arm.status())" in code:
+                return '{"lower_arm": 0, "upper_arm": 0, "claw": 0.0, ' \
+                       '"base_angle": 0, "base_speed": 0}\n'
+            return ""
+
+    def _load(self, installed):
+        link = self.Link(installed)
+        session = arm_serial.ArmSession(link)
+        saved = []
+        session._save_library = saved.append
+        real = arm_serial.STATE_FILE
+        arm_serial.STATE_FILE = os.path.join(tempfile.gettempdir(), "no-such-state.json")
+        try:
+            with contextlib.redirect_stdout(io.StringIO()):
+                session.load()
+        finally:
+            arm_serial.STATE_FILE = real
+        return link, saved
+
+    def test_saves_the_library_when_it_changed(self):
+        link, saved = self._load("-")
+        self.assertEqual(saved, [arm_serial.source_version()])
+        self.assertTrue(any("from cyberbrick_arm import CyberBrickArm" in c
+                            for c in link.code))
+
+    def test_uses_the_saved_copy_when_it_is_current(self):
+        link, saved = self._load(arm_serial.source_version())
+        self.assertEqual(saved, [])
+        self.assertTrue(any("arm = CyberBrickArm()" in c for c in link.code))
+
+
+class PortLockTest(unittest.TestCase):
+    """A second arm_serial.py waits for the port instead of breaking in."""
+
+    def _open(self, errors):
+        attempts = []
+
+        def fake_serial(*args, **kw):
+            attempts.append(kw.get("exclusive"))
+            if errors:
+                raise arm_serial.serial.SerialException(errors.pop(0))
+            return object()
+        link = arm_serial.CyberBrickSerial("/dev/ttyACM9")
+        link.port = "/dev/ttyACM9"
+        real, arm_serial.serial.Serial = arm_serial.serial.Serial, fake_serial
+        real_sleep, time.sleep = time.sleep, lambda s: None
+        try:
+            with contextlib.redirect_stdout(io.StringIO()) as out:
+                ok = link._open()
+        finally:
+            arm_serial.serial.Serial, time.sleep = real, real_sleep
+        return ok, attempts, out.getvalue()
+
+    def test_waits_while_another_command_has_the_port(self):
+        ok, attempts, out = self._open([
+            "Could not exclusively lock port /dev/ttyACM9: [Errno 11] Resource "
+            "temporarily unavailable"] * 3)
+        self.assertTrue(ok)
+        self.assertEqual(attempts, [True] * 4)
+        self.assertEqual(out.count("in use by another program"), 1)
+
+    def test_other_errors_fail_at_once(self):
+        ok, attempts, out = self._open(["[Errno 2] No such file or directory"])
+        self.assertFalse(ok)
+        self.assertEqual(len(attempts), 1)
 
 
 class BootHookTest(unittest.TestCase):
@@ -748,6 +1072,36 @@ class BootHookTest(unittest.TestCase):
         with contextlib.redirect_stdout(io.StringIO()):
             arm_boot._receiver()
         self.assertEqual(self.tried, [("arm_radio_fake_old", "lib")])
+
+    def test_power_cycle_during_start_tries_radio_mode_again(self):
+        # Switched off while still starting up: the counter says 1, but that
+        # was not a crash, so radio mode (the first try) runs again.
+        arm_boot.TRIES = (("arm_radio_fake", "lib"), ("arm_radio_fake_old", "lib"))
+        self._modules(set())
+        with open(arm_boot.COUNT_FILE, "w") as f:
+            f.write("1")
+        real = machine.reset_cause
+        machine.reset_cause = lambda: machine.PWRON_RESET
+        try:
+            with contextlib.redirect_stdout(io.StringIO()):
+                arm_boot._receiver()
+        finally:
+            machine.reset_cause = real
+        self.assertEqual(self.tried, [("arm_radio_fake", "lib")])
+
+    def test_soft_reset_restarts_the_board_first(self):
+        # A soft reset leaves Wi-Fi unable to send, so radio mode must not
+        # start on top of it.
+        arm_boot.TRIES = (("arm_radio_fake", "lib"),)
+        self._modules(set())
+        real = machine.reset_cause
+        machine.reset_cause = lambda: machine.SOFT_RESET
+        try:
+            with self.assertRaises(SystemExit):
+                arm_boot._receiver()
+        finally:
+            machine.reset_cause = real
+        self.assertEqual(self.tried, [])
 
     def test_everything_broken_means_stock(self):
         arm_boot.TRIES = (("arm_radio_fake", "lib"),)
