@@ -223,6 +223,12 @@ const clawParams = Type.Object({
   position: Type.Number({ minimum: 0, maximum: 1, description: "Opening from 0 (closed) to 1 (open)." }),
 });
 
+const speedParam = Type.Number({
+  minimum: 1,
+  maximum: 100,
+  description: "1 (slow) to 100 (instant). Default 20, about 90°/s.",
+});
+
 const moveParams = Type.Object({
   lower: Type.Optional(
     Type.Number({
@@ -238,13 +244,7 @@ const moveParams = Type.Object({
       description: "Upper arm position: 0 = home (folded) .. 180 = fully extended.",
     }),
   ),
-  speed: Type.Optional(
-    Type.Number({
-      minimum: 1,
-      maximum: 100,
-      description: "1 (slow) to 100 (instant). Default 20, about 90°/s.",
-    }),
-  ),
+  speed: Type.Optional(speedParam),
 });
 
 // Default swings per gesture (GESTURES in arm_serial.py).
@@ -268,6 +268,36 @@ const gestureParams = Type.Object({
   ),
 });
 
+const homeParams = Type.Object({ speed: Type.Optional(speedParam) });
+
+const baseReferenceParams = Type.Object({
+  angle: Type.Optional(
+    Type.Number({
+      minimum: -BASE_LIMIT,
+      maximum: BASE_LIMIT,
+      description:
+        "Where the base really faces now: -90 (full left) .. 0 (straight ahead) .. 90 (full right). Default 0.",
+    }),
+  ),
+});
+
+const clawReferenceParams = Type.Object({
+  state: Type.Unsafe<"open" | "closed">({
+    type: "string",
+    enum: ["open", "closed"],
+    description: "What the claw really is right now: fully open or fully closed.",
+  }),
+});
+
+function checkSpeed(raw: unknown): string | undefined {
+  if (raw === undefined || raw === null) return undefined;
+  const speed = Number(raw);
+  if (!Number.isFinite(speed) || speed < 1 || speed > 100) {
+    throw new Error("speed must be between 1 and 100");
+  }
+  return String(speed);
+}
+
 // The host hands parameters over untyped; type them from their schema.
 const typed = <T extends TSchema>(_schema: T, raw: unknown) => (raw ?? {}) as Partial<Static<T>>;
 
@@ -275,7 +305,7 @@ export default definePluginEntry({
   id: PLUGIN_ID,
   name: "CyberBrick Arm",
   description:
-    "Control a CyberBrick robotic arm: turn the base up to 90° left or right, move the arm joints, open and close the claw.",
+    "Control a CyberBrick robotic arm: turn the base up to 90° left or right, move the arm joints, open and close the claw, and wave, nod or shake.",
   register(api) {
     const settings = () => resolveSettings(api.pluginConfig ?? {}, api.rootDir);
 
@@ -402,13 +432,8 @@ export default definePluginEntry({
         if (lower !== undefined && upper !== undefined) args = ["move", String(lower), String(upper)];
         else if (lower !== undefined) args = ["lower", String(lower)];
         else args = ["upper", String(upper)];
-        if (params.speed !== undefined) {
-          const speed = Number(params.speed);
-          if (!Number.isFinite(speed) || speed < 1 || speed > 100) {
-            throw new Error("speed must be between 1 and 100");
-          }
-          args.push(String(speed));
-        }
+        const speed = checkSpeed(params.speed);
+        if (speed !== undefined) args.push(speed);
         return armCommand(settings(), args, (r) => {
           const notes: string[] = [];
           const check = (asked: number | undefined, got: number | undefined, name: string) => {
@@ -458,10 +483,11 @@ export default definePluginEntry({
       label: "Arm home",
       description:
         "Return the arm to its home pose: both joints to position 0 (home, folded) and the base " +
-        "to centre. The claw is unchanged.",
-      parameters: noParams,
-      async execute() {
-        return armCommand(settings(), ["home"]);
+        "to centre. The claw is unchanged. Optional joint speed 1-100.",
+      parameters: homeParams,
+      async execute(_id, raw) {
+        const speed = checkSpeed(typed(homeParams, raw).speed);
+        return armCommand(settings(), speed === undefined ? ["home"] : ["home", speed]);
       },
     });
 
@@ -472,6 +498,73 @@ export default definePluginEntry({
       parameters: noParams,
       async execute() {
         return armCommand(settings(), ["stop"]);
+      },
+    });
+
+    api.registerTool({
+      name: "cyberbrick_arm_set_base_reference",
+      label: "Re-centre base estimate",
+      description:
+        "Nothing moves. Tell the arm which way its base really faces now, when its estimated " +
+        "base_angle has drifted (the base has no sensor). Typical use: the user says the base " +
+        "faces straight ahead although the status says otherwise, so set angle 0. Only use it " +
+        "with an angle the user has confirmed by looking at the arm; never guess.",
+      parameters: baseReferenceParams,
+      async execute(_id, raw) {
+        const params = typed(baseReferenceParams, raw);
+        const angle = params.angle === undefined ? 0 : Number(params.angle);
+        if (!Number.isFinite(angle) || Math.abs(angle) > BASE_LIMIT) {
+          throw new Error(`angle must be between -${BASE_LIMIT} and ${BASE_LIMIT}`);
+        }
+        return armCommand(settings(), ["base-set", String(angle)], () =>
+          `The arm now takes its base to face ${describeBase(angle)}.`,
+        );
+      },
+    });
+
+    api.registerTool({
+      name: "cyberbrick_arm_set_claw_reference",
+      label: "Re-sync claw estimate",
+      description:
+        "Nothing moves. Tell the arm whether its claw is really fully open or fully closed now, " +
+        "when the estimated claw opening has drifted (the claw has no sensor), e.g. the status " +
+        "says open but the user sees it closed. Only use it with a state the user has confirmed.",
+      parameters: clawReferenceParams,
+      async execute(_id, raw) {
+        const state = typed(clawReferenceParams, raw).state;
+        if (state !== "open" && state !== "closed") {
+          throw new Error('state must be "open" or "closed"');
+        }
+        return armCommand(settings(), ["claw-set", state], () => `The arm now takes the claw to be ${state}.`);
+      },
+    });
+
+    api.registerTool({
+      name: "cyberbrick_arm_check_link",
+      label: "Check radio link",
+      description:
+        "Nothing moves. Radio mode only: check the link to the arm and report round-trip time, " +
+        "signal strength, the arm's free memory, why it last restarted and any radio or timer " +
+        "error. Use it to troubleshoot slow or failing commands. Over USB it fails; use " +
+        "cyberbrick_arm_status instead.",
+      parameters: noParams,
+      async execute() {
+        return armCommand(settings(), ["ping"], (r) => r.output.trim());
+      },
+    });
+
+    api.registerTool({
+      name: "cyberbrick_arm_restart",
+      label: "Restart arm",
+      description:
+        "Restart the arm's control code to recover from a board error, such as a timer_error " +
+        "in the status or moves that succeed but do nothing. Radio: reboots the arm and waits " +
+        "for it. USB: reloads the arm library. The joints may move to their home pose; the " +
+        "base and claw estimates are kept. Use only after an error, not as a routine step, " +
+        "and warn the user first if something is in the claw.",
+      parameters: noParams,
+      async execute() {
+        return armCommand(settings(), ["restart"], () => "Arm restarted.");
       },
     });
   },

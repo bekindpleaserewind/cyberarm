@@ -23,10 +23,12 @@ for `radio-pair` and `radio-install`, which need the user to move USB cables.
 
 The base angle is estimated from timing, so it can drift.
 
-1. Ask the user to look at the arm. If it is a little off, use
-   `cyberbrick_arm_face_angle` to put it where the user says it should be, then tell the
-   arm that is centre: run `arm_serial.py base-set 0` once it physically faces straight
-   ahead. (`base-set ANGLE` tells it any known angle.)
+1. Ask the user to look at the arm and say where the base really faces. If they say it
+   faces straight ahead, call `cyberbrick_arm_set_base_reference` with angle 0 (nothing
+   moves; it only corrects the estimate). If it faces some other known angle, pass that.
+   To get it back to centre, first `cyberbrick_arm_face_angle` to where the user says
+   centre is, then, once they confirm, `cyberbrick_arm_set_base_reference` 0. Never set a
+   reference angle the user has not confirmed.
 2. If it always ends up short or overshoots, the timing is off: the user should run
    `arm_serial.py base-tune` (interactive): the arm makes timed turns and the user says how
    far each one went, until it is 90°. It also fixes left/right being swapped.
@@ -35,8 +37,9 @@ The base angle is estimated from timing, so it can drift.
 
 Timing is off. The user should run `arm_serial.py claw-calibrate` (interactive): it closes
 the claw, then times a full open and a full close while they press Enter at the moment the
-claw stops moving. If the claw estimate is just out of sync, put it in a known state and
-tell the arm: `arm_serial.py claw-set closed` (or `claw-set open`).
+claw stops moving. If the claw estimate is just out of sync (the user sees it closed but the status says
+open, or the other way round), call `cyberbrick_arm_set_claw_reference` with `closed` or
+`open` as the user describes it. Nothing moves.
 
 ## A joint hits the table, the base or the arm, or its direction is unknown
 
@@ -71,13 +74,15 @@ all the saved values, and `cyberbrick_arm_status` reports the joint positions an
 
 - The servos and motor are powered by the **battery** on the arm, not USB. Ask the user
   to check the battery is on and charged. Using battery and USB together is fine.
-- Run `arm_serial.py status`; a `timer_error` entry means the board's control loop
-  crashed. Run `arm_serial.py reset` (radio) or `arm_serial.py --reload status` (USB) to restart it.
+- Call `cyberbrick_arm_status`; a timer error warning means the board's control loop
+  crashed. Call `cyberbrick_arm_restart` once to recover (warn the user first if the claw
+  holds something: the joints may go home), then check the status again.
 
 ## Connection errors
 
-Run `arm_serial.py ping` first in radio mode: it shows whether the arm answers, the signal
-strength and the arm's free RAM.
+In radio mode, call `cyberbrick_arm_check_link` first: it shows whether the arm answers,
+the signal strength, the arm's free RAM and why it last restarted. (Over USB it fails;
+use `cyberbrick_arm_status`.)
 
 | Error says                                  | Do this                                                       |
 | ------------------------------------------- | ------------------------------------------------------------- |
@@ -91,7 +96,7 @@ strength and the arm's free RAM.
 | stock firmware had not finished starting    | Run `arm_serial.py reset`, wait 5 seconds, try again.          |
 | MemoryError                                 | Run `arm_serial.py reset`, wait 5 seconds, then `arm_serial.py install`. |
 | Permission denied on /dev/ttyACM0 (Linux)   | The user needs to be in the `dialout` group.                  |
-| timed out                                   | Run `arm_serial.py reset`, wait 5 seconds, retry once.        |
+| timed out                                   | Call `cyberbrick_arm_restart` once, then retry the command once. |
 
 Do not retry a failing command more than once; report the error and the fix to the user.
 
@@ -108,7 +113,8 @@ Radio mode: `arm_serial.py remote` puts the arm and the remote back into stick m
 Switching the arm off and on returns it to radio mode, and the next arm command switches
 the remote back into a bridge. USB mode: `arm_serial.py reset` reboots the receiver into
 its normal remote-control mode. Moving the base with the sticks makes the base estimate
-wrong: afterwards, centre the base and run `arm_serial.py base-set 0`.
+wrong: afterwards, have the user centre the base and call
+`cyberbrick_arm_set_base_reference` 0.
 
 ## Safety settings (in cyberbrick_arm.py)
 

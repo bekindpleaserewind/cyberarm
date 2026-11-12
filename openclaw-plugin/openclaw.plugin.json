@@ -1,7 +1,7 @@
 {
   "id": "cyberbrick-arm",
   "name": "CyberBrick Arm",
-  "description": "Control a CyberBrick robotic arm over the radio (through the CyberBrick remote) or USB: turn the base (max 90 degrees left or right of centre), move the arm joints, and open or close the claw.",
+  "description": "Control a CyberBrick robotic arm over the radio (through the CyberBrick remote) or USB: turn the base (max 90 degrees left or right of centre), move the arm joints, open or close the claw, and wave, nod or shake.",
   "version": "0.1.0",
   "categories": ["other"],
   "activation": {
@@ -17,8 +17,13 @@
       "cyberbrick_arm_close_claw",
       "cyberbrick_arm_set_claw",
       "cyberbrick_arm_move",
+      "cyberbrick_arm_gesture",
       "cyberbrick_arm_home",
-      "cyberbrick_arm_stop"
+      "cyberbrick_arm_stop",
+      "cyberbrick_arm_set_base_reference",
+      "cyberbrick_arm_set_claw_reference",
+      "cyberbrick_arm_check_link",
+      "cyberbrick_arm_restart"
     ]
   },
   "configSchema": {

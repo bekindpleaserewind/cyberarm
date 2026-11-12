@@ -871,7 +871,7 @@ class ArmSession:
             BOOT_PATH, BOOT_PATH + ".tmp", INSTALL_PATH, INSTALL_PATH + ".tmp",
             INSTALL_VERSION, "/cyberbrick_arm_old.mpy", RADIO_PATH,
             RADIO_PATH + ".tmp", RADIO_VERSION, "/arm_radio_old.mpy",
-            RADIO_CONFIG, MODE_FILE, COUNT_FILE)
+            RADIO_CONFIG, MODE_FILE, COUNT_FILE, "/arm_diag.json")
         print("Removed the arm library and radio mode from the board; it boots "
               "into its normal remote-control mode." if n
               else "The arm library was not installed.")
@@ -1171,6 +1171,114 @@ class RadioSession:
             print("Timer error on the arm:", status["timer_error"])
         print("Status:", _public(status))
 
+    def debug(self):
+        """Print the radio counters of both boards and return them. Read only.
+
+        Run it right after a radio failure, before switching anything off:
+        the counters are lost when a board restarts. Nothing is retried and
+        the remote is never restarted, so a dead link still shows what each
+        side saw. The remote is read first, before this adds any traffic.
+        """
+        remote = json.loads(self.link.exec(
+            "import json, network\n"
+            "try:\n"
+            " _c = network.WLAN(network.STA_IF).config('channel')\n"
+            "except Exception:\n"
+            " _c = None\n"
+            "print(json.dumps({'st': list(_b.e.stats()), 'rssi': _b.rssi(), "
+            "'ch': _c}))\n"
+            "del _c").strip().splitlines()[-1])
+        out = {"remote": remote, "status": None, "arm": None, "prev": None,
+               "error": None}
+        try:
+            out["status"] = self.request(["p"], 5, retry=False)[0]
+            out["arm"] = self.request(["d"], 5, retry=False)[1]
+            out["prev"] = self.request(["d", "prev"], 5, retry=False)[1]
+        except (RadioError, DeviceError) as e:
+            out["error"] = str(e)
+            if "unknown op" in out["error"]:
+                out["error"] += " (the arm's radio code is older; run 'update')"
+
+        print(f"Remote: ESP-NOW {_counters(remote['st'])}; signal "
+              f"{remote['rssi']} dBm, channel {remote['ch']}.")
+        status = out["status"]
+        if status:
+            if status.get("radio_error"):
+                print("Last radio error on the arm:", status["radio_error"])
+            if status.get("timer_error"):
+                print("Timer error on the arm:", status["timer_error"])
+        if out["arm"]:
+            print("Arm, this boot:")
+            for line in describe_diag(out["arm"]):
+                print("  " + line)
+        if out["arm"] is not None or out["prev"] is not None:
+            if out["prev"]:
+                print("Arm, last snapshot from before this boot:")
+                for line in describe_diag(out["prev"], snapshot=True):
+                    print("  " + line)
+            else:
+                print("Arm: no snapshot from before this boot.")
+        if out["error"]:
+            print("Could not read the arm:", out["error"])
+        return out
+
+
+def _span(ms):
+    """ms as "1h 2m 3s"."""
+    s = int(ms) // 1000
+    h, m = s // 3600, s // 60 % 60
+    return (f"{h}h {m}m {s % 60}s" if h else f"{m}m {s % 60}s" if m
+            else f"{s}s")
+
+
+def _counters(st):
+    """ESP-NOW stats() as text, raw.
+
+    Measured on the boards' firmware (MicroPython 1.23 preview): a send acked
+    on its first try can still add 0-2 to both the results and the failed
+    counters, so these do not count sends one to one and no "% not acked"
+    can be worked out from them. Compare readings over time instead."""
+    return (f"sent {st[0]}, send results {st[1]}, failed results {st[2]}, "
+            f"received {st[3]}, dropped {st[4]}")
+
+
+def describe_diag(d, snapshot=False):
+    """The arm's "d" diagnostics (see arm_radio.Server.diag) as text lines.
+
+    Some fields can be missing: the arm drops the least useful ones when the
+    reply would not fit in one radio message."""
+    lines = []
+    when = "saved after" if snapshot else "up"
+    lines.append(f"boot {d.get('boot')}, {when} {_span(d.get('up', 0))}, "
+                 f"main loop {d.get('loop')} rounds"
+                 + (", saved just before a recovery reboot" if d.get("rb") else ""))
+    last = d.get("last")
+    lines.append(f"requests heard {d.get('rx')}, ignored {d.get('ign', '?')}, "
+                 + ("none yet" if last is None else f"last one {_span(last)} "
+                    + ("before saving" if snapshot else "ago")))
+    if "st" in d:
+        lines.append("ESP-NOW " + _counters(d["st"]))
+    if "mv" in d:
+        lines.append(f"reply sends while moving {d['mv'][0]}, of them not acked "
+                     f"{d['mv'][1]}")
+    rc = d.get("rc", [0, 0, 0, 0])
+    lines.append(f"replies given up on {d.get('sf', '?')}; recovery: radio restart "
+                 f"fixed {rc[1]} of {rc[0]}, Wi-Fi restart fixed {rc[3]} of {rc[2]}")
+    fixes = {0: "not fixed yet", 1: "radio restart", 2: "Wi-Fi restart",
+             3: "reboot"}
+    for up_s, moving, step in d.get("ev", []):
+        lines.append(f"  incident at {_span(up_s * 1000)}"
+                     + (" while moving" if moving else "")
+                     + f": {fixes.get(step, step)}")
+    wifi = [f"channel {d['ch']}"] if "ch" in d else []
+    if "pm" in d:
+        wifi.append(f"power save {d['pm']}")
+    if "ap" in d:
+        wifi.append("AP on" if d["ap"] else "AP off")
+    if wifi:
+        lines.append("Wi-Fi: " + ", ".join(wifi))
+    return lines
+
 
 def _stop_on_ctrl_c(session, job):
     """Run job(session); on Ctrl-C, stop the arm before passing it on."""
@@ -1443,6 +1551,7 @@ COMMANDS = {
 SESSION_COMMANDS = {
     "shell": "shell                        interactive prompt",
     "reset": "reset                        reboot the arm (USB: into stock firmware)",
+    "restart":   "restart                      restart the arm's control code (radio: reboot; USB: reload)",
     "install":   "install                      USB: save the arm library now (done anyway when it changed)",
     "uninstall": "uninstall                    remove it and radio mode from the board (USB)",
     "claw-calibrate": "claw-calibrate               time a full claw open and close and save them",
@@ -1455,13 +1564,14 @@ SESSION_COMMANDS = {
     "radio-pair": "radio-pair [CHANNEL]         USB in the remote: set it up as the radio bridge",
     "radio-install": "radio-install                USB in the arm, once: install radio mode",
     "ping":      "ping                         radio: check the link to the arm",
+    "debug":     "debug                        radio: both boards' radio counters (read only)",
     "update":    "update [--force]             radio: send changed board code to the arm",
     "remote":    "remote                       radio: hand the arm to the stick remote",
 }
 # Old command names that still work.
 ALIASES = {"claw-cal": "claw-set", "base-calibrate": "base-tune"}
 USB_ONLY = {"install", "uninstall", "probe", "radio-pair", "radio-install"}
-RADIO_ONLY = {"ping", "update", "remote"}
+RADIO_ONLY = {"ping", "debug", "update", "remote"}
 CALIBRATIONS = {}   # filled in below: name -> function(session)
 
 
@@ -2033,7 +2143,7 @@ def main(argv=None):
     result = {"ok": False, "command": opts.command, "before": None,
               "status": None, "output": "", "error": None}
     if opts.command in SESSION_COMMANDS and opts.command not in (
-            "reset", "ping", "calibration", "gesture"):
+            "reset", "restart", "ping", "debug", "calibration", "gesture"):
         result["error"] = f"{opts.command!r} is interactive or changes the " \
                           "board; run it without --json"
         print(json.dumps(result))
@@ -2051,6 +2161,9 @@ def main(argv=None):
     with contextlib.redirect_stdout(Tee()):
         code, extra = _main(opts)
     result.update(extra)
+    if opts.command == "ping" and not result["output"]:
+        # The link report is printed; hand it over as the output too.
+        result["output"] = "".join(log).strip()
     result["ok"] = code == 0
     if not result["ok"] and not result["error"]:
         lines = [l for l in "".join(log).splitlines() if l.strip()]
@@ -2138,13 +2251,31 @@ def _main(opts):
         else:
             session = RadioSession(link, pair)
 
-        session.load(force=opts.reload)
+        if opts.command == "debug":
+            # Not load(): its ping restarts the remote when the link is down,
+            # which would wipe the remote's counters.
+            session._check_remote()
+            session._ensure_bridge()
+            extra["debug"] = session.debug()
+            if extra["debug"]["error"]:
+                extra["error"] = extra["debug"]["error"]
+                return 1, extra
+            return 0, extra
+
+        # restart over USB = load the arm library afresh (this homes the joints).
+        session.load(force=opts.reload or (opts.command == "restart" and transport == "usb"))
         if opts.command in CALIBRATIONS:
             CALIBRATIONS[opts.command](session)
             return 0, extra
         if opts.command == "reset":
             session.reboot("radio")
             print("Arm restarted:", _public(session.last_status))
+            return 0, extra
+        if opts.command == "restart":
+            if transport == "radio":
+                session.reboot("radio")
+            extra["status"] = session.status()
+            print("Arm restarted:", extra["status"])
             return 0, extra
         if opts.command == "calibration":
             keys = _source_cal_keys()

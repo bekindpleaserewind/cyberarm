@@ -243,11 +243,19 @@ lists them all. Joint positions run from 0 (home, folded) to 180 (fully extended
 | Base | `turn ANGLE`, `turn-by DEGREES`, `base SPEED [SECONDS]`, `base-set [ANGLE]` |
 | Everyday | `status`, `stop`, `demo`, `shell` |
 | Calibration | `arm-calibrate`, `arm-align`, `base-tune`, `claw-calibrate`, `calibration` |
-| Wireless | `radio-pair`, `radio-install`, `ping`, `update`, `remote` |
-| Board | `reset`, `install`, `uninstall`, `probe`, `raw CODE` |
+| Wireless | `radio-pair`, `radio-install`, `ping`, `debug`, `update`, `remote` |
+| Board | `reset`, `restart`, `install`, `uninstall`, `probe`, `raw CODE` |
 
 Every command and option is described in
 [src/README.md](src/README.md#arm_serialpy).
+
+If a radio command fails, run `python arm_serial.py debug` before switching either board
+off. It reads both boards' radio counters without retrying anything or restarting the
+remote. It also shows the snapshot the arm saved before its last restart, so you can
+still see what happened after the arm has been switched off and on. The arm also tries
+to fix a stuck radio by itself: it restarts ESP-NOW, then Wi-Fi, then reboots, keeping
+the joints where they were. See
+[Radio diagnostics](src/README.md#radio-diagnostics).
 
 ## Agent tools
 
@@ -261,8 +269,12 @@ Every command and option is described in
 | `cyberbrick_arm_open_claw`   | Open the claw                                     |
 | `cyberbrick_arm_close_claw`  | Close the claw                                    |
 | `cyberbrick_arm_set_claw`    | Open the claw part way                            |
-| `cyberbrick_arm_home`        | Return to the home pose                           |
+| `cyberbrick_arm_home`        | Return to the home pose (optional speed)          |
 | `cyberbrick_arm_stop`        | Stop immediately                                  |
+| `cyberbrick_arm_set_base_reference` | Tell the arm where the base really faces (re-centre after drift; nothing moves) |
+| `cyberbrick_arm_set_claw_reference` | Tell the arm the claw is really open or closed (nothing moves) |
+| `cyberbrick_arm_check_link`  | Radio: reply time, signal, free RAM, last restart cause |
+| `cyberbrick_arm_restart`     | Restart the arm's control code after a board error |
 
 ## Project layout
 

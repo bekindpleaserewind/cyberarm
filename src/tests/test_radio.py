@@ -164,8 +164,20 @@ for _name, _cls in (("servos", ServosController), ("motors", MotorsController)):
 
 
 class WLAN:
+    # One interface per kind, as on the board: WLAN(STA_IF) twice is the
+    # same interface. (Both boards share these fakes, on the same channel.)
+    channels = {}
+
     def __init__(self, _if):
-        self.channel = None
+        self._if = _if
+
+    @property
+    def channel(self):
+        return WLAN.channels.get(self._if)
+
+    @channel.setter
+    def channel(self, value):
+        WLAN.channels[self._if] = value
 
     def active(self, on=None):
         return True
@@ -176,11 +188,15 @@ class WLAN:
     def config(self, *args, **kw):
         if "channel" in kw:
             self.channel = kw["channel"]
+        if args == ("channel",):
+            return self.channel
+        if args == ("pm",):
+            return 1
         return b"\x00" * 6
 
 
 network = types.ModuleType("network")
-network.WLAN, network.STA_IF = WLAN, 0
+network.WLAN, network.STA_IF, network.AP_IF = WLAN, 0, 1
 sys.modules["network"] = network
 
 
@@ -192,6 +208,7 @@ class Air:
         self.next_mac = None
         self.idle = lambda node, timeout: CLOCK.advance(timeout)
         self.drop = None          # drop(sender_mac, msg) -> True to lose it
+        self.deaf = set()         # MACs whose radio neither sends nor hears
 
 
 AIR = Air()
@@ -223,6 +240,8 @@ class ESPNow:
     def send(self, mac, msg, sync=True):
         data = msg.encode() if isinstance(msg, str) else bytes(msg)
         assert len(data) <= 250, f"ESP-NOW message too long ({len(data)} bytes)"
+        if self.mac in AIR.deaf or bytes(mac) in AIR.deaf:
+            return False          # no ack, nothing delivered
         node = AIR.nodes.get(bytes(mac))
         # Encrypted link: both ends must have the same keys for each other.
         if (node is None or node.pmk != self.pmk
@@ -232,6 +251,9 @@ class ESPNow:
             return True           # sent, but lost on the way
         node.queue.append((self.mac, data))
         return True
+
+    def stats(self):
+        return (7, 7, 0, 3, 0)
 
     def irecv(self, timeout_ms):
         if not self.queue:
@@ -284,6 +306,7 @@ class RadioTest(unittest.TestCase):
         tmp = self.tmp.name
         AIR.nodes.clear()
         AIR.drop = None
+        AIR.deaf.clear()
         CLOCK.timers.clear()
         cyberbrick_arm.CAL_FILE = os.path.join(tmp, "arm_cal.json")
         for key in cyberbrick_arm.CAL_KEYS:          # back to the defaults
@@ -292,6 +315,8 @@ class RadioTest(unittest.TestCase):
             name: tuple(os.path.join(tmp, os.path.basename(p)) for p in paths)
             for name, paths in ORIGINAL_UPDATES.items()}
         arm_serial.STATE_FILE = os.path.join(tmp, "state.json")
+        arm_radio.DIAG_FILE = os.path.join(tmp, "arm_diag.json")
+        arm_radio.HOLD_FILE = os.path.join(tmp, "arm_hold.json")
 
         # The arm (receiver)
         AIR.next_mac = ARM_MAC
@@ -332,6 +357,7 @@ class RadioTest(unittest.TestCase):
             if msg:
                 self.server.handle(msg)
             self.server.poll()
+            self.server.recover()
             CLOCK.advance(10)
             if node.queue:
                 return
@@ -464,6 +490,276 @@ class RadioTest(unittest.TestCase):
         self.arm.timer_error = None
         self.arm._base_pos = 0
         self.assertEqual(self.session.ping()["radio_error"], ("OSError: " + "x" * 31))
+
+    def test_debug_reads_both_boards(self):
+        self.session.ping()
+        self._snapshot_due()                       # a snapshot from "before"
+        self.server.prev = arm_radio._read(arm_radio.DIAG_FILE)
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            got = self.session.debug()
+        self.assertIsNone(got["error"])
+        self.assertEqual(got["remote"]["st"], [7, 7, 0, 3, 0])
+        self.assertEqual(got["remote"]["ch"], PAIR["channel"])
+        self.assertEqual(got["arm"]["boot"], 1234)
+        self.assertEqual(got["prev"]["boot"], 1234)
+        text = out.getvalue()
+        self.assertIn("Remote: ESP-NOW sent 7, send results 7, failed results 0", text)
+        self.assertIn("Arm, this boot:", text)
+        self.assertIn("last snapshot from before this boot", text)
+        self.assertIn("channel 6, power save 1, AP on", text)
+
+    def test_debug_on_a_dead_link_keeps_the_remote_running(self):
+        AIR.deaf.add(ARM_MAC)
+        got = self.quiet(self.session.debug)
+        self.assertEqual(self.remote_restarts, 0)   # its counters survive
+        self.assertIn("no radio contact", got["error"])
+        self.assertEqual(got["remote"]["st"], [7, 7, 0, 3, 0])
+        self.assertIsNone(got["arm"])
+
+    def test_debug_text_copes_with_missing_fields(self):
+        d = {"up": 3723000, "boot": 9, "loop": 5, "last": None, "rx": 0,
+             "sf": 1, "rc": [2, 1, 1, 0], "ev": [[60, 1, 3]], "rb": 1}
+        lines = arm_serial.describe_diag(d, snapshot=True)
+        self.assertIn("saved after 1h 2m 3s", lines[0])
+        self.assertIn("recovery reboot", lines[0])
+        self.assertIn("none yet", lines[1])
+        self.assertIn("radio restart fixed 1 of 2, Wi-Fi restart fixed 0 of 1",
+                      lines[2])
+        self.assertIn("incident at 1m 0s while moving: reboot", lines[3])
+
+    def test_diagnostics_count_the_radio_traffic_and_fit_in_one_message(self):
+        for _ in range(3):
+            self.session.ping()
+        self.server.radio.e.queue.append((b"\xcc" * 6, b"[1]"))   # a stranger
+        self.server.radio.e.queue.append((REMOTE_MAC, b"x"))       # not a request
+        self.server.radio.recv(0)
+        self.server.radio.recv(0)
+        self.server.error = "OSError: " + "x" * 300
+        d = self.session.request(["d"], 5)[1]
+        self.assertEqual(d["rx"], 4)              # 3 pings and this request
+        self.assertEqual(d["ign"], 2)
+        self.assertEqual(d["sf"], 0)
+        self.assertNotIn("sr", d)                 # same as st[2]
+        self.assertEqual(d["ch"], PAIR["channel"])
+        self.assertEqual(d["pm"], 1)
+        self.assertEqual(d["ap"], 1)
+        self.assertEqual(d["st"], [7, 7, 0, 3, 0])
+        self.assertNotIn("err", d)                # it is in the status instead
+        self.assertEqual(d["boot"], 1234)
+        self.assertEqual(d["last"], 0)            # this request, just now
+        self.assertNotIn("d", self.calls)         # not an arm method call
+        # Even with huge counters the reply fits in one ESP-NOW message, with
+        # the spare fields left out first.
+        radio = self.server.radio
+        radio.rx = radio.ign = radio.tx_retry = radio.tx_fail = 10 ** 9
+        radio.e.stats = lambda: (10 ** 9,) * 5
+        self.server.loops = 10 ** 9
+        CLOCK.now = 2 ** 30 - 1
+        d = self.session.request(["d"], 5)[1]    # the fake air checks the size
+        self.assertEqual(d["up"], 2 ** 30 - 1)
+        for key in ("boot", "loop", "last", "rx", "st", "ch", "rc"):
+            self.assertIn(key, d)
+
+    def test_a_busy_day_of_diagnostics_fits_with_every_field(self):
+        server, radio = self.server, self.server.radio
+        CLOCK.now = 6 * 3600 * 1000               # 6 hours up
+        server.loops, radio.rx, radio.ign = 2000000, 5000, 12
+        radio.tx_retry, radio.tx_fail, radio.mv = 900, 40, [2500, 700]
+        radio.last_rx = CLOCK.now - 123456
+        radio.e.stats = lambda: (6000, 6000, 900, 5012, 3)
+        server.rc, server.rec_reboot = [40, 31, 9, 6], True
+        server.ev = [[21000, 1, 1], [21500, 0, 2], [21599, 1, 3]]
+        d = server.diag()
+        self.assertLessEqual(len(arm_radio._dumps([65535, "D", None, d])), 250)
+        for key in arm_radio.DIAG_SPARE + ("rb",):
+            self.assertIn(key, d)
+
+    def _snapshot_due(self):
+        CLOCK.advance(arm_radio.DIAG_EVERY_MS)
+        self.server.save_diag()
+
+    def test_snapshot_is_saved_while_idle_and_read_after_a_reboot(self):
+        self.session.ping()
+        self.server.save_diag()                   # not due yet
+        self.assertFalse(os.path.exists(arm_radio.DIAG_FILE))
+        self._snapshot_due()
+        with open(arm_radio.DIAG_FILE) as f:
+            saved = json.load(f)
+        self.assertEqual((saved["boot"], saved["rx"]), (1234, 1))
+        self.assertLess(len(json.dumps([65535, "D", None, saved])), 251)
+        # The file is overwritten in place, never added to.
+        self.session.ping()
+        self._snapshot_due()
+        with open(arm_radio.DIAG_FILE) as f:
+            self.assertEqual(json.load(f)["rx"], 2)
+        self.assertEqual(os.listdir(os.path.dirname(arm_radio.DIAG_FILE)).count(
+            "arm_diag.json"), 1)
+        # Before the snapshot of this boot is overwritten, "d prev" has the
+        # one from the boot before; on the first boot there is none.
+        self.assertIsNone(self.session.request(["d", "prev"], 5)[1])
+        self.server = arm_radio.Server(self.arm, self.server.radio, 999)
+        prev = self.session.request(["d", "prev"], 5)[1]
+        self.assertEqual((prev["boot"], prev["rx"]), (1234, 2))
+
+    def test_snapshot_waits_until_nothing_moves(self):
+        CLOCK.advance(arm_radio.DIAG_EVERY_MS)    # due...
+        self.arm.move_arm(150, 150, speed=1, wait=False)
+        self.assertTrue(self.arm.joints_moving())
+        self.server.save_diag()                   # ...but a joint is moving
+        self.assertFalse(os.path.exists(arm_radio.DIAG_FILE))
+        self.arm.hold_joints()
+        self.server.save_diag()                   # due, and now idle
+        self.assertTrue(os.path.exists(arm_radio.DIAG_FILE))
+
+    def test_snapshot_is_skipped_when_flash_is_short(self):
+        from unittest import mock
+        short = (4096, 4096, 100, 10, 10)         # 40 KB free
+        with mock.patch.object(arm_radio.os, "statvfs", lambda _p: short):
+            self._snapshot_due()
+        self.assertFalse(os.path.exists(arm_radio.DIAG_FILE))
+        self._snapshot_due()                      # plenty free again
+        self.assertTrue(os.path.exists(arm_radio.DIAG_FILE))
+
+    def test_failed_reply_sends_are_counted(self):
+        radio = self.server.radio
+        radio.e.send = lambda *a: False
+        self.assertFalse(radio.send([1, "D", None]))
+        self.assertEqual((radio.tx_retry, radio.tx_fail), (3, 1))
+
+    # ------------------------------------------------------- radio recovery
+
+    def _arm_goes_deaf_after_next_request(self):
+        """What the arm showed: it takes in one request, then its radio
+        neither sends nor hears until something is restarted."""
+        e = self.server.radio.e
+        real_irecv = e.irecv
+
+        def irecv(timeout_ms):
+            mac, data = real_irecv(timeout_ms)
+            if data:
+                AIR.deaf.add(ARM_MAC)
+                e.irecv = real_irecv
+            return mac, data
+        e.irecv = irecv
+
+    def _cured_by(self, name):
+        radio = self.server.radio
+        real = getattr(radio, name)
+
+        def restart():
+            real()                        # the real code, against the fakes
+            AIR.deaf.discard(ARM_MAC)
+        setattr(radio, name, restart)
+
+    def test_recovery_step_1_restarts_esp_now_and_the_command_still_works(self):
+        self._cured_by("restart_espnow")
+        self._arm_goes_deaf_after_next_request()
+        status = self.session.ping()              # no error for the PC
+        self.assertEqual(status["boot"], 1234)
+        self.assertEqual(self.server.rc, [1, 1, 0, 0])
+        self.assertEqual(self.server.radio.tx_fail, 1)
+        self.assertIsNone(self.server.reboot)
+        self.assertIsNone(self.server.rec)
+        d = self.session.request(["d"], 5)[1]
+        self.assertEqual(d["rc"], [1, 1, 0, 0])
+        self.assertEqual([e[1:] for e in d["ev"]], [[0, 1]])   # idle, step 1
+        self.assertFalse(os.path.exists(arm_radio.HOLD_FILE))
+
+    def test_recovery_step_2_restarts_wifi_when_esp_now_was_not_enough(self):
+        self._cured_by("restart_wifi")
+        self._arm_goes_deaf_after_next_request()
+        self.session.ping()                       # still answered in time
+        self.assertEqual(self.server.rc, [1, 0, 1, 1])
+        self.assertIsNone(self.server.reboot)
+
+    def test_recovery_reboots_into_radio_mode_and_says_so(self):
+        self._arm_goes_deaf_after_next_request()  # nothing cures it
+        with self.assertRaises(arm_serial.RadioError) as cm:
+            self.quiet(self.session.ping)
+        self.assertIn("no reply from the arm", str(cm.exception))
+        self.assertEqual(self.server.reboot, "radio")
+        self.assertEqual(self.server.rc, [1, 0, 1, 0])
+        with open(arm_radio.DIAG_FILE) as f:
+            saved = json.load(f)
+        self.assertEqual((saved["rb"], saved["rc"]), (1, [1, 0, 1, 0]))
+        self.assertEqual([e[1:] for e in saved["ev"]], [[0, 3]])
+        # The joints are held and their angles kept for after the reboot.
+        with open(arm_radio.HOLD_FILE) as f:
+            held = json.load(f)
+        self.assertEqual(held, {"1": self.arm.servo_angle(1),
+                                "2": self.arm.servo_angle(2), "b": 1234})
+        # Radio mode starting again after that reset puts them back.
+        fresh = cyberbrick_arm.CyberBrickArm()
+        try:
+            arm_radio.restore_hold(fresh, machine.HARD_RESET)
+            self.assertEqual((fresh.servo_angle(1), fresh.servo_angle(2)),
+                             (held["1"], held["2"]))
+        finally:
+            fresh.shutdown()
+
+    def _hold(self, boot=1234, snapshot_boot=1234, rb=1):
+        with open(arm_radio.HOLD_FILE, "w") as f:
+            json.dump({"1": 150, "2": 30, "b": boot}, f)
+        with open(arm_radio.DIAG_FILE, "w") as f:
+            json.dump({"boot": snapshot_boot, "rb": rb} if rb else
+                      {"boot": snapshot_boot}, f)
+
+    def test_held_joints_are_put_back_only_after_our_own_reset(self):
+        self._hold()
+        fresh = cyberbrick_arm.CyberBrickArm()          # starts at home
+        try:
+            self.assertEqual(fresh.servo_angle(1), 90)
+            arm_radio.restore_hold(fresh, machine.HARD_RESET)
+            self.assertEqual((fresh.servo_angle(1), fresh.servo_angle(2)), (150, 30))
+            self.assertFalse(os.path.exists(arm_radio.HOLD_FILE))   # used up
+        finally:
+            fresh.shutdown()
+        # After switching on, or with a hold file that does not belong to the
+        # last recovery reboot, the joints go home and the file is discarded.
+        for rst, hold in ((machine.PWRON_RESET, {}),
+                          (machine.HARD_RESET, {"snapshot_boot": 999}),
+                          (machine.HARD_RESET, {"rb": 0})):
+            self._hold(**hold)
+            fresh = cyberbrick_arm.CyberBrickArm()
+            try:
+                arm_radio.restore_hold(fresh, rst)
+                self.assertEqual(fresh.servo_angle(1), 90, (rst, hold))
+                self.assertFalse(os.path.exists(arm_radio.HOLD_FILE))
+            finally:
+                fresh.shutdown()
+        arm_radio.restore_hold(self.arm, machine.HARD_RESET)   # no file: no-op
+
+    def test_failed_sends_are_counted_as_moving_or_idle(self):
+        radio = self.server.radio
+        radio.e.send = lambda *a: False
+        radio.send([1, "D", None])                       # idle
+        self.assertEqual((radio.mv, radio.fail_moving), ([0, 0], 0))
+        self.arm.move_arm(150, 150, speed=1, wait=False)
+        radio.send([2, "A"])                             # while moving
+        self.assertEqual((radio.mv, radio.fail_moving), ([3, 3], 1))
+        self.assertEqual(radio.tx_retry, 6)
+
+    def test_recovery_during_a_move_rides_on_the_remote_check_ins(self):
+        self._cured_by("restart_espnow")
+        e = self.server.radio.e
+        real_send = e.send
+
+        def send(mac, msg, sync=True):            # deaf from the "done" reply
+            if '"D"' in msg:
+                AIR.deaf.add(ARM_MAC)
+                e.send = real_send
+            return real_send(mac, msg, sync)
+        e.send = send
+        self.session.call("move_arm", 150, 150, speed=50)
+        self.assertEqual(self.server.rc, [1, 1, 0, 0])
+        self.assertGreater(self.server.radio.mv[0], 0)  # "A" went out mid-move
+        self.assertIsNone(self.server.reboot)
+
+    def test_ordinary_traffic_never_starts_recovery(self):
+        for _ in range(20):
+            self.session.ping()
+        self.assertEqual(self.server.rc, [0, 0, 0, 0])
 
     def test_backup_copies_are_reported(self):
         server = arm_radio.Server(self.arm, self.server.radio, 1, "cyberbrick_arm_old", 1)
@@ -1114,7 +1410,10 @@ class BootHookTest(unittest.TestCase):
 class CompileTest(unittest.TestCase):
     """Every board file compiles for MicroPython 1.23 and stays small."""
 
-    BUDGET = {"cyberbrick_arm": 9000, "arm_radio": 6000, "arm_bridge": 2000,
+    # arm_radio: 6000 -> 7500 for the radio diagnostics, recovery and joint
+    # hold (the snapshot part is meant to come out again once the radio
+    # fault is understood). The arm had 55 KB of RAM free with it at 6.5 KB.
+    BUDGET = {"cyberbrick_arm": 9000, "arm_radio": 7500, "arm_bridge": 2000,
               "arm_boot": 2000}
 
     def test_sizes(self):
