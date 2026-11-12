@@ -1,7 +1,13 @@
 # CyberBrick Arm plugin for OpenClaw
 
 Lets an OpenClaw agent control the CyberBrick robotic arm: turn the base (never more than
-90° left or right of centre), move the two arm joints, and open or close the claw.
+90° left or right of centre), move the two arm joints, open or close the claw, and gesture
+(wave, nod, shake). It can also fix drifted base and claw estimates, check the radio link
+and restart the arm after a board error.
+
+Interactive or board-changing driver commands (calibration, pairing, `install`, `update`,
+`remote`) and unsafe ones (`release`, `claw-spin`, `raw`) are left out: the agent tells the
+user the command to run instead.
 
 The tools run the PC driver `./src/arm_serial.py`. Once radio mode is set up, it sends
 commands through the CyberBrick remote over the radio, so the arm needs no USB cable.
@@ -18,8 +24,13 @@ Before that, it talks to the arm's receiver board over USB serial.
 | `cyberbrick_arm_open_claw`   | Open the claw fully                                 |
 | `cyberbrick_arm_close_claw`  | Close the claw fully                                |
 | `cyberbrick_arm_set_claw`    | Open the claw part way (0-1)                        |
-| `cyberbrick_arm_home`        | Joints to home (position 0), base to centre         |
+| `cyberbrick_arm_gesture`     | `wave`, `nod` or `shake` in one smooth motion, then back to the start pose |
+| `cyberbrick_arm_home`        | Joints to home (position 0), base to centre, optional speed |
 | `cyberbrick_arm_stop`        | Stop base and claw, hold joints                     |
+| `cyberbrick_arm_set_base_reference` | Tell the arm where the base really faces (re-centre after drift; nothing moves) |
+| `cyberbrick_arm_set_claw_reference` | Tell the arm the claw is really open or closed (nothing moves) |
+| `cyberbrick_arm_check_link`  | Radio: reply time, signal, free RAM, last restart cause |
+| `cyberbrick_arm_restart`     | Restart the arm's control code after a board error |
 
 The 90° base limit is enforced three times: the tool schemas, the tool code, and the
 board library itself (`BASE_LIMIT_DEG` in `src/cyberbrick_arm.py`).
@@ -92,5 +103,8 @@ Optional, under `plugins.entries.cyberbrick-arm.config`:
   and saved in `src/.arm_state.json` so they survive a board reboot. If the base was moved
   by hand or with the remote, centre it and run `arm_serial.py base-set 0`.
 - Commands are queued; only one uses the link at a time.
+- Every tool in `index.ts` must also be listed under `contracts.tools` in
+  `openclaw.plugin.json`. OpenClaw drops undeclared tools with only a diagnostic, so the
+  agent never sees them.
 - Each command takes about a second longer than the movement itself to open the serial
   port.

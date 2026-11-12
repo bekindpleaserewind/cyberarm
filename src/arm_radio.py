@@ -24,6 +24,9 @@ Ops (there is no way to run arbitrary code over the radio):
     "fw", base64                write the next piece of it
     "fc", sha256_hex, version   check it and swap it in (old copy kept)
     "r", "radio" | "stock"      reboot, into radio mode or stock remote mode
+    "d"                         radio diagnostics (read only): see Server.diag
+    "d", "prev"                 the last diagnostics snapshot saved before
+                                this boot (DIAG_FILE), or None
 
 A request repeated with the same seq is never run twice: the arm answers with
 the reply it already has. Only messages from the paired remote are accepted,
@@ -43,6 +46,23 @@ MODE_FILE = "/arm_mode"          # read by the boot hook
 MAX_MSG = 250                    # ESP-NOW payload limit
 STATUS_MAX = MAX_MSG - 16        # room for the status in [seq, "D", status]
 FREE_RUN_MAX_MS = 20000          # free spins stop by themselves after this
+# Diagnostics snapshot, so a radio outage that needs a power cycle leaves
+# evidence: one small file (under MAX_MSG bytes), overwritten in place every
+# DIAG_EVERY_MS while nothing moves, and skipped when flash is short.
+DIAG_FILE = "/arm_diag.json"
+DIAG_EVERY_MS = 30000
+DIAG_MIN_FREE = 64 * 1024
+# Radio recovery (Server.recover): after a reply fails every try, wait this
+# long after each step to hear the remote again. The remote resends every
+# 300 ms while waiting for a reply and checks in every 1500 ms during a move,
+# and gives up after 5 s, so both steps fit before it does.
+RECOVER_WAIT_MS = 1600
+# Joint angles saved just before a recovery reboot and put back as radio mode
+# starts, so the joints stay where they were instead of going home.
+HOLD_FILE = "/arm_hold.json"
+JOINT_SERVOS = (1, 2)
+# Dropped in this order if a diagnostics reply would not fit in one message.
+DIAG_SPARE = ("ign", "pm", "ap", "sf", "ev", "mv")
 
 # Parts of the arm, as bit flags.
 JOINTS, CLAW, BASE = 1, 2, 4
@@ -88,6 +108,11 @@ UPDATES = {
 }
 
 
+def _dumps(obj):
+    """Compact JSON (no spaces), so more fits in one ESP-NOW message."""
+    return json.dumps(obj, separators=(",", ":"))
+
+
 def _remove(path):
     try:
         os.remove(path)
@@ -128,36 +153,87 @@ class Radio:
             self.wlan.disconnect()
         except OSError:
             pass
-        self.wlan.config(channel=int(cfg["channel"]))
-        self.e = espnow.ESPNow()
-        self.e.active(True)
-        self.e.set_pmk(binascii.unhexlify(cfg["pmk"]))
+        self.channel = int(cfg["channel"])
+        self.wlan.config(channel=self.channel)
+        self.pmk = binascii.unhexlify(cfg["pmk"])
+        self.lmk = binascii.unhexlify(cfg["lmk"])
         self.peer = binascii.unhexlify(cfg["peer"].replace(":", ""))
-        lmk = binascii.unhexlify(cfg["lmk"])
+        self.e = espnow.ESPNow()
+        self._start_espnow()
+        # Counters for the "d" diagnostics request.
+        self.rx = 0            # requests taken from the peer
+        self.ign = 0           # messages ignored (other boards, not a request)
+        self.tx_retry = 0      # reply sends that were not acked (each try)
+        self.tx_fail = 0       # replies given up on after every try failed
+        self.last_rx = None    # tick of the last request from the peer
+        self.busy = None       # callable: is any part of the arm moving?
+        self.mv = [0, 0]       # send tries while moving, of them not acked
+        self.fail_moving = 0   # 1 if the last reply given up on was sent
+                               # while something moved
+
+    def _start_espnow(self):
+        self.e.active(True)
+        self.e.set_pmk(self.pmk)
         try:
-            self.e.add_peer(self.peer, lmk)
+            self.e.add_peer(self.peer, self.lmk)
         except OSError:
-            # Already added by an earlier start attempt in this boot.
-            self.e.mod_peer(self.peer, lmk)
+            # Already added (an earlier start attempt in this boot).
+            self.e.mod_peer(self.peer, self.lmk)
+
+    def restart_espnow(self):
+        """Recovery step 1: switch ESP-NOW off and on, and add the peer again."""
+        try:
+            self.e.active(False)
+        except OSError:
+            pass
+        self._start_espnow()
+
+    def restart_wifi(self):
+        """Recovery step 2: switch the Wi-Fi interface off and on, back on our
+        channel, then ESP-NOW. (We switched it on ourselves, so active(True)
+        is not the stock-firmware case that hangs.)"""
+        try:
+            self.e.active(False)
+        except OSError:
+            pass
+        self.wlan.active(False)
+        self.wlan.active(True)
+        try:
+            self.wlan.disconnect()
+        except OSError:
+            pass
+        self.wlan.config(channel=self.channel)
+        self._start_espnow()
 
     def recv(self, timeout_ms):
         """The next message from the peer as bytes, or None."""
         mac, msg = self.e.irecv(timeout_ms)
-        if msg and mac == self.peer and msg[0] == 0x5B:   # '['
+        if not msg:
+            return None
+        if mac == self.peer and msg[0] == 0x5B:   # '['
+            self.rx += 1
+            self.last_rx = time.ticks_ms()
             return bytes(msg)
+        self.ign += 1
         return None
 
     def send(self, reply):
-        data = json.dumps(reply)
+        data = _dumps(reply)
         if len(data) > MAX_MSG:
-            data = json.dumps([reply[0], "E", "reply too long"])
+            data = _dumps([reply[0], "E", "reply too long"])
+        moving = 1 if self.busy and self.busy() else 0
         for _ in range(3):
+            self.mv[0] += moving
             try:
                 if self.e.send(self.peer, data, True):
                     return True
             except OSError:
                 pass
+            self.tx_retry += 1
+            self.mv[1] += moving
             time.sleep_ms(5)
+        self.tx_fail += 1
+        self.fail_moving = moving
         return False
 
 
@@ -181,6 +257,28 @@ class Server:
         self.reboot = None     # "radio" / "stock" once a reboot was asked for
         self.file = None       # update in progress: [name, file object, sha256]
         self.error = None      # last error from the main loop
+        self.loops = 0         # main-loop rounds: shows the loop kept running
+        # Radio recovery: the step running as [step, until tick, rx and
+        # tx_fail counts when it started], or None; the tx_fail count
+        # already dealt with; and [step 1 tries, step 1 fixes, step 2 tries,
+        # step 2 fixes].
+        self.rec = None
+        self.fails_seen = 0
+        self.rc = [0, 0, 0, 0]
+        self.rec_reboot = False    # rebooting because recovery failed
+        # The last 3 recoveries: [uptime s, 1 if the failed reply was sent
+        # while something moved, step that fixed it (3 = reboot; 0 = still
+        # trying)].
+        self.ev = []
+        radio.busy = self.moving
+        # The snapshot saved before this boot, read before it is overwritten.
+        self.prev = _read(DIAG_FILE)
+        self.next_save = time.ticks_add(time.ticks_ms(), DIAG_EVERY_MS)
+
+    def moving(self):
+        arm = self.arm
+        return bool(self.wait or arm.joints_moving() or arm.claw_moving()
+                    or arm.base_moving())
 
     # ----------------------------------------------------------------- replies
 
@@ -200,7 +298,7 @@ class Server:
             if key in s:
                 s[key] = s[key][:40]
         for key in ("radio_error", "timer_error", "code"):
-            if len(json.dumps(s)) <= STATUS_MAX:
+            if len(_dumps(s)) <= STATUS_MAX:
                 break
             s.pop(key, None)
         return s
@@ -259,7 +357,157 @@ class Server:
                 raise ValueError("reboot mode must be radio or stock")
             self.reboot = args[0]
             return None
+        if op == "d":
+            if args and args[0] == "prev":
+                return json.loads(self.prev) if self.prev else None
+            return self.diag()
         raise ValueError("unknown op %r" % op)
+
+    def diag(self):
+        """Radio diagnostics, as seen from the arm. Read only.
+
+        up   ms since boot          st   ESP-NOW stats(): sends, send
+        boot boot id                     results, not acked (every reply
+        loop main-loop rounds            try goes through Radio.send, so
+        last ms since the last           this is tx_retry), received,
+             request (None: none)        dropped
+        rx   requests heard         ch   Wi-Fi channel
+        ign  messages ignored       pm   Wi-Fi power-save mode
+        sf   replies given up on    ap   1 if the Wi-Fi AP interface is on
+        rc   radio recovery: [step 1 tries, step 1 fixes, step 2 tries,
+             step 2 fixes] (see recover)
+        rb   1: saved just before a recovery reboot (only then)
+        ev   the last 3 recoveries: [uptime s, moving when the reply failed,
+             step that fixed it (3 = reboot, 0 = still trying)]
+        mv   send tries while something moved, and of them not acked
+             (idle = the totals in st minus these)
+
+        Fields in DIAG_SPARE are left out if the reply would not fit in one
+        message.
+        """
+        r = self.radio
+        now = time.ticks_ms()
+        d = {"up": now, "boot": self.boot, "loop": self.loops,
+             "last": (None if r.last_rx is None
+                      else time.ticks_diff(now, r.last_rx)),
+             "rx": r.rx, "ign": r.ign, "sf": r.tx_fail,
+             "rc": self.rc, "ev": self.ev, "mv": r.mv}
+        if self.rec_reboot:
+            d["rb"] = 1
+        try:
+            d["st"] = list(r.e.stats())
+        except Exception:
+            pass
+        try:
+            d["ch"] = r.wlan.config("channel")
+        except Exception:
+            pass
+        try:
+            d["pm"] = r.wlan.config("pm")
+        except Exception:
+            pass
+        try:
+            import network
+            d["ap"] = int(network.WLAN(network.AP_IF).active())
+        except Exception:
+            pass
+        # (The last main-loop error is in status() as radio_error.)
+        # Keep the whole reply, [seq, "D", None, d], to one message.
+        for key in DIAG_SPARE:
+            if len(_dumps([65535, "D", None, d])) <= MAX_MSG:
+                break
+            d.pop(key, None)
+        return d
+
+    # --------------------------------------------------------------- recovery
+
+    def recover(self):
+        """Bring the radio back when a reply fails every try. Called from the
+        main loop.
+
+        Seen on the arm: after a while idle, the radio takes in one request,
+        then neither its replies nor anything sent to it get through, while
+        this loop keeps running, until the arm is switched off and on. So:
+          step 1  restart ESP-NOW,
+          step 2  restart the Wi-Fi interface (and ESP-NOW),
+          step 3  reboot into radio mode, like "r" (the snapshot says so).
+        A step has worked when the remote is heard again and the reply to it
+        gets through; the remote is still resending, so the request that hit
+        the problem is answered. self.rc counts tries and fixes.
+        """
+        r = self.radio
+        rec = self.rec
+        if rec is None:
+            if r.tx_fail != self.fails_seen:
+                self.fails_seen = r.tx_fail
+                self.ev.append([time.ticks_ms() // 1000, r.fail_moving, 0])
+                del self.ev[:-3]
+                self._recover_step(1)
+            return
+        step, until, rx0, fails0 = rec
+        if r.tx_fail != fails0:
+            self.fails_seen = r.tx_fail
+            self._recover_step(step + 1)        # still cannot send
+        elif r.rx != rx0:
+            self.rc[2 * step - 1] += 1          # heard, and the reply got out
+            self.ev[-1][2] = step
+            self.rec = None
+            self.next_save = time.ticks_ms()    # record it soon
+        elif time.ticks_diff(time.ticks_ms(), until) >= 0:
+            self._recover_step(step + 1)        # heard nothing
+
+    def _recover_step(self, step):
+        r = self.radio
+        if step > 2:
+            self.rec = None
+            self.rec_reboot = True
+            self.ev[-1][2] = 3
+            try:
+                self.next_save = time.ticks_ms()
+                self.save_diag(force=True)
+            except Exception:
+                pass
+            try:
+                # Keep the joints where they are across the reboot (run()
+                # puts them back).
+                arm = self.arm
+                arm.hold_joints()
+                held = {str(s): arm.servo_angle(s) for s in JOINT_SERVOS}
+                held["b"] = self.boot
+                with open(HOLD_FILE, "w") as f:
+                    f.write(_dumps(held))
+            except Exception:
+                pass
+            self.reboot = "radio"
+            return
+        self.rc[2 * step - 2] += 1
+        try:
+            if step == 1:
+                r.restart_espnow()
+            else:
+                r.restart_wifi()
+        except Exception as e:
+            self.error = "recover %d: %s: %s" % (step, type(e).__name__, e)
+        self.rec = [step, time.ticks_add(time.ticks_ms(), RECOVER_WAIT_MS),
+                    r.rx, r.tx_fail]
+
+    def save_diag(self, force=False):
+        """Every DIAG_EVERY_MS while nothing moves, overwrite DIAG_FILE with
+        diag(), unless flash is short. Called from the main loop."""
+        now = time.ticks_ms()
+        if time.ticks_diff(now, self.next_save) < 0:
+            return
+        arm = self.arm
+        if not force and (self.wait or self.free or self.file
+                          or arm.joints_moving() or arm.claw_moving()
+                          or arm.base_moving()):
+            return             # try again on the next round
+        self.next_save = time.ticks_add(now, DIAG_EVERY_MS)
+        st = os.statvfs("/")
+        if st[0] * st[4] < DIAG_MIN_FREE:     # block size * free blocks
+            return
+        with open(DIAG_FILE, "w") as f:
+            f.write(_dumps(self.diag()))
 
     def call(self, name, args=(), kwargs=None, timeout_s=60):
         if name not in METHODS:
@@ -356,6 +604,7 @@ def serve(server):
     radio = server.radio
     while True:
         try:
+            server.loops += 1
             msg = radio.recv(10)
             if msg:
                 server.handle(msg)
@@ -365,6 +614,8 @@ def serve(server):
                     # moment, and status() "mem" shows what is really free.
                     gc.collect()
             server.poll()
+            server.recover()
+            server.save_diag()
             if server.reboot:
                 if server.reboot == "stock":
                     with open(MODE_FILE, "w") as f:
@@ -390,6 +641,31 @@ def _led(rgb):
         pass
 
 
+def restore_hold(arm, rst):
+    """After a recovery reboot, put the joints back where they were held.
+
+    Only after a reset by this code (machine.HARD_RESET, as machine.reset()
+    gives), and only if DIAG_FILE is the recovery-reboot snapshot of the same
+    boot that held them (so a file left behind, e.g. when a backup copy ran
+    in between, is never used later); after power-on the joints go home as
+    usual. The file is used up either way.
+    """
+    data = _read(HOLD_FILE)
+    if data is None:
+        return
+    _remove(HOLD_FILE)
+    try:
+        held = json.loads(data)
+        snap = json.loads(_read(DIAG_FILE) or "{}")
+        if (rst != machine.HARD_RESET or not snap.get("rb")
+                or snap.get("boot") != held.get("b")):
+            return
+        for servo in JOINT_SERVOS:
+            arm._set_servo(servo, held[str(servo)])
+    except Exception:
+        pass               # the joints stay at home
+
+
 def run(lib="cyberbrick_arm", on_ready=None):
     """Start radio mode. Returns only after Ctrl-C (from a USB session).
 
@@ -400,14 +676,15 @@ def run(lib="cyberbrick_arm", on_ready=None):
         sys.path.append("/bbl")
     with open(RADIO_FILE) as f:
         cfg = json.load(f)
-    radio = Radio(cfg)
-    gc.collect()
-    arm = __import__(lib).CyberBrickArm()
-    gc.collect()
     try:
         rst = machine.reset_cause()
     except Exception:
         rst = None
+    radio = Radio(cfg)
+    gc.collect()
+    arm = __import__(lib).CyberBrickArm()
+    restore_hold(arm, rst)     # straight away: the library just sent them home
+    gc.collect()
     server = Server(arm, radio, int.from_bytes(os.urandom(2), "big"), lib, rst)
     if on_ready:
         on_ready()

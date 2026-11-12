@@ -1,6 +1,6 @@
 ---
 name: cyberbrick-arm
-description: Control the CyberBrick robotic arm - turn (spin) the base left or right up to 90 degrees, move the lower and upper arm joints, and open or close the claw. Use when the user asks the arm to move, point, turn, spin, reach, grab, release, open, close, go home or stop, or asks where the arm is.
+description: Control the CyberBrick robotic arm - turn (spin) the base left or right up to 90 degrees, move the lower and upper arm joints, open or close the claw, and wave, nod or shake. Use when the user asks the arm to move, point, turn, spin, reach, grab, release, open, close, wave, nod, shake its head, say hello, yes or no, go home or stop, or asks where the arm is.
 metadata: {"openclaw": {"emoji": "🦾"}}
 ---
 
@@ -32,8 +32,16 @@ Left and right are as seen from **behind** the arm, looking the way it faces at 
 | `cyberbrick_arm_close_claw`  | Close the claw fully                                        |
 | `cyberbrick_arm_set_claw`    | Open the claw part way (`position` 0-1)                     |
 | `cyberbrick_arm_gesture`     | `wave`, `nod` or `shake` in one smooth call, then back to the start pose (optional `times`, `speed`) |
-| `cyberbrick_arm_home`        | Joints to position 0 (home, folded) and base to centre (claw unchanged) |
+| `cyberbrick_arm_home`        | Joints to position 0 (home, folded) and base to centre (claw unchanged; optional `speed`) |
 | `cyberbrick_arm_stop`        | Stop base and claw now, hold joints where they are          |
+| `cyberbrick_arm_set_base_reference` | Nothing moves: tell the arm where the base really faces (`angle`, default 0) |
+| `cyberbrick_arm_set_claw_reference` | Nothing moves: tell the arm the claw is really `open` or `closed` |
+| `cyberbrick_arm_check_link`  | Nothing moves: radio link health (reply time, signal, free RAM) |
+| `cyberbrick_arm_restart`     | Restart the arm's control code after a board error (joints may go home) |
+
+For wave, nod (yes) and shake (no), always use `cyberbrick_arm_gesture`: one call does the
+whole gesture smoothly. See the `cyberbrick-arm-routines` skill for longer routines, and
+`cyberbrick-arm-setup` for when to use the last four tools.
 
 ## Base rotation rule (hard limit)
 
@@ -89,7 +97,7 @@ long they have moved, so:
 
 - `base_angle` and `claw` can drift a few degrees / percent over many moves. If the user
   says the arm is not where the status says, use the `cyberbrick-arm-setup` skill to
-  re-centre it.
+  re-centre it (`cyberbrick_arm_set_base_reference` / `cyberbrick_arm_set_claw_reference`).
 - If the arm was moved by hand or with the CyberBrick remote, the estimates are wrong
   until re-centred.
 - A claw holding an object stops before "closed"; the claw value still reads 0. That is
