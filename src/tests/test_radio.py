@@ -62,6 +62,13 @@ class Clock:
 
 import gc  # noqa: E402
 gc.mem_free = lambda: 51234           # MicroPython only
+gc.mem_alloc = lambda: 40000
+
+esp32 = types.ModuleType("esp32")     # MicroPython only
+esp32.HEAP_DATA = 4
+esp32.heap = [(121072, 19116, 18432, 19088), (116496, 10144, 9728, 9920)]
+esp32.idf_heap_info = lambda caps: list(esp32.heap)
+sys.modules["esp32"] = esp32
 
 CLOCK = Clock()
 for _name in ("ticks_ms", "ticks_add", "ticks_diff", "sleep_ms"):
@@ -164,35 +171,61 @@ for _name, _cls in (("servos", ServosController), ("motors", MotorsController)):
 
 
 class WLAN:
-    # One interface per kind, as on the board: WLAN(STA_IF) twice is the
-    # same interface. (Both boards share these fakes, on the same channel.)
-    channels = {}
+    # Measured on the remote: the station (STA_IF) and the access point
+    # (AP_IF) are one radio. Switching either on switches both on; switching
+    # either off stops Wi-Fi altogether (the station reads off, disconnect()
+    # raises "Wifi Not Started"), and a channel set while it is off is
+    # ignored (it reads 1). The state starts as the stock firmware leaves it
+    # (WLAN.reset): on, power saving on, channel not set by us.
+    # (Both boards share these fakes.)
+    PM_NONE, PM_PERFORMANCE = 0, 1
+    on = True
+    ch = None                     # None: not set by us (the board reads 1)
+    pm = 1
+    tx = 19.5                     # dBm; a guess at the firmware default
+    log = []                      # (interface, on) for every active(on)
+
+    @classmethod
+    def reset(cls):
+        cls.on, cls.ch, cls.pm, cls.tx, cls.log = True, None, 1, 19.5, []
 
     def __init__(self, _if):
         self._if = _if
 
-    @property
-    def channel(self):
-        return WLAN.channels.get(self._if)
-
-    @channel.setter
-    def channel(self, value):
-        WLAN.channels[self._if] = value
-
     def active(self, on=None):
-        return True
+        if on is None:
+            return WLAN.on
+        WLAN.log.append((self._if, bool(on)))
+        WLAN.on = bool(on)
 
     def disconnect(self):
-        pass
+        if not WLAN.on:
+            raise OSError("Wifi Not Started")
+
+    def status(self):
+        return 1000                    # STAT_IDLE
 
     def config(self, *args, **kw):
-        if "channel" in kw:
-            self.channel = kw["channel"]
+        if "channel" in kw and WLAN.on:
+            WLAN.ch = kw["channel"]
+        if "pm" in kw:
+            WLAN.pm = kw["pm"]
+        if "txpower" in kw:
+            if not WLAN.on:
+                raise OSError("Wifi Not Started")
+            WLAN.tx = kw["txpower"]
+        if args == ("txpower",):
+            return WLAN.tx
+        if args == ("ssid",):
+            return ""
         if args == ("channel",):
-            return self.channel
+            return 1 if WLAN.ch is None else WLAN.ch
         if args == ("pm",):
-            return 1
+            return WLAN.pm
         return b"\x00" * 6
+
+
+WLAN.reset()
 
 
 network = types.ModuleType("network")
@@ -205,6 +238,7 @@ class Air:
 
     def __init__(self):
         self.nodes = {}
+        self.boots = {}           # MAC -> how many times its radio started
         self.next_mac = None
         self.idle = lambda node, timeout: CLOCK.advance(timeout)
         self.drop = None          # drop(sender_mac, msg) -> True to lose it
@@ -213,18 +247,43 @@ class Air:
 
 AIR = Air()
 
+MSG_ROOM = 263                    # rxbuf bytes per full-size message
+
 
 class ESPNow:
+    """One board's ESP-NOW, with what the real one does to a stale link.
+
+    Stale link state (the suspected cause of "acked but no reply"): the
+    receiver ties its peer entry to the sender's radio start (boot) on the
+    first message after add_peer. Once the sender restarts, its messages
+    are still acked but never delivered, until the receiver removes and
+    adds the peer again (or restarts ESP-NOW)."""
+
     def __init__(self):
         self.mac = AIR.next_mac
+        AIR.boots[self.mac] = AIR.boots.get(self.mac, 0) + 1
+        self.boot = AIR.boots[self.mac]
         AIR.nodes[self.mac] = self
         self.queue = []
         self.peers = {}
+        self.bound = {}           # peer MAC -> its boot, once it was heard
         self.pmk = None
         self.peers_table = {}
+        self.rxbuf = 526          # the firmware's default: 2 messages
+        self.room = 2
+        self.dropped = 0          # full buffer (still acked)
+        self.stale = 0            # stale link state (still acked)
+
+    def config(self, **kw):
+        if "rxbuf" in kw:
+            self.rxbuf = kw["rxbuf"]
 
     def active(self, on):
-        pass
+        if on:
+            self.room = max(1, self.rxbuf // MSG_ROOM)
+        else:
+            self.peers.clear()    # esp_now_deinit forgets every peer
+            self.bound.clear()
 
     def set_pmk(self, pmk):
         self.pmk = pmk
@@ -233,9 +292,16 @@ class ESPNow:
         if mac in self.peers:
             raise OSError("ESP_ERR_ESPNOW_EXIST")
         self.peers[mac] = lmk
+        self.bound.pop(bytes(mac), None)
 
     def mod_peer(self, mac, lmk=None):
         self.peers[mac] = lmk
+
+    def del_peer(self, mac):
+        if mac not in self.peers:
+            raise OSError("ESP_ERR_ESPNOW_NOT_FOUND")
+        del self.peers[mac]
+        self.bound.pop(bytes(mac), None)
 
     def send(self, mac, msg, sync=True):
         data = msg.encode() if isinstance(msg, str) else bytes(msg)
@@ -243,12 +309,24 @@ class ESPNow:
         if self.mac in AIR.deaf or bytes(mac) in AIR.deaf:
             return False          # no ack, nothing delivered
         node = AIR.nodes.get(bytes(mac))
+        # No radio there, or the (shared) Wi-Fi is off or not on our channel.
+        if node is None or not WLAN.on or WLAN.ch is None:
+            return False
+        if bytes(mac) not in self.peers:
+            raise OSError("ESP_ERR_ESPNOW_NOT_FOUND")
         # Encrypted link: both ends must have the same keys for each other.
-        if (node is None or node.pmk != self.pmk
+        if (node.pmk != self.pmk
                 or node.peers.get(self.mac) != self.peers.get(bytes(mac))):
             return False
         if AIR.drop and AIR.drop(self.mac, data):
             return True           # sent, but lost on the way
+        bound = node.bound.setdefault(self.mac, self.boot)
+        if bound != self.boot:
+            node.stale += 1
+            return True           # acked, never delivered
+        if len(node.queue) >= node.room:
+            node.dropped += 1
+            return True           # acked, buffer full
         node.queue.append((self.mac, data))
         return True
 
@@ -256,7 +334,7 @@ class ESPNow:
         return (7, 7, 0, 3, 0)
 
     def irecv(self, timeout_ms):
-        if not self.queue:
+        if not self.queue and timeout_ms:
             AIR.idle(self, timeout_ms)
         if self.queue:
             mac, data = self.queue.pop(0)
@@ -305,9 +383,23 @@ class RadioTest(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory()
         tmp = self.tmp.name
         AIR.nodes.clear()
+        AIR.boots.clear()
         AIR.drop = None
         AIR.deaf.clear()
+        WLAN.reset()
         CLOCK.timers.clear()
+        arm_radio.WIFI_MARK = os.path.join(tmp, "arm_wifi_try")
+        arm_bridge.WIFI_MARK = os.path.join(tmp, "remote_wifi_try")
+        # No heartbeat unless a test asks for one: the fake timers would add
+        # its traffic to every test's counts.
+        from unittest import mock
+        beat = mock.patch.object(arm_bridge, "HEARTBEAT_MS", 0)
+        beat.start()
+        self.addCleanup(beat.stop)
+        from unittest import mock
+        rekey = mock.patch.multiple(arm_radio, IDLE_REKEY=True, RECOVER_REBOOT=True)
+        rekey.start()                 # the tests cover them whichever way they ship
+        self.addCleanup(rekey.stop)
         cyberbrick_arm.CAL_FILE = os.path.join(tmp, "arm_cal.json")
         for key in cyberbrick_arm.CAL_KEYS:          # back to the defaults
             setattr(cyberbrick_arm, key, DEFAULTS[key])
@@ -358,6 +450,7 @@ class RadioTest(unittest.TestCase):
                 self.server.handle(msg)
             self.server.poll()
             self.server.recover()
+            self.server.idle_rekey()
             CLOCK.advance(10)
             if node.queue:
                 return
@@ -451,7 +544,7 @@ class RadioTest(unittest.TestCase):
         self._radio_outage(3500)
         self.assertEqual(self.session.ping()["boot"], 1234)
 
-    def test_a_long_outage_gives_a_radio_error_after_about_5_s(self):
+    def test_a_long_outage_gives_a_radio_error_after_about_10_s(self):
         # The arm's radio acknowledged the messages (they were lost after
         # that), so it is not the remote's fault: no restart, no resend.
         self._radio_outage(60000)
@@ -507,7 +600,11 @@ class RadioTest(unittest.TestCase):
         self.assertIn("Remote: ESP-NOW sent 7, send results 7, failed results 0", text)
         self.assertIn("Arm, this boot:", text)
         self.assertIn("last snapshot from before this boot", text)
-        self.assertIn("channel 6, power save 1, AP on", text)
+        self.assertIn("Wi-Fi: on, channel 6, power save 0, transmit power 19.5 dBm, "
+                      "full reset at start-up",
+                      text)
+        self.assertIn("Remote Wi-Fi: on, channel 6, power save 0, "
+                      "transmit power 19.5 dBm, full reset at start-up", text)
 
     def test_debug_on_a_dead_link_keeps_the_remote_running(self):
         AIR.deaf.add(ARM_MAC)
@@ -542,8 +639,10 @@ class RadioTest(unittest.TestCase):
         self.assertEqual(d["sf"], 0)
         self.assertNotIn("sr", d)                 # same as st[2]
         self.assertEqual(d["ch"], PAIR["channel"])
-        self.assertEqual(d["pm"], 1)
-        self.assertEqual(d["ap"], 1)
+        self.assertEqual(d["pm"], WLAN.PM_NONE)  # set by the remote's start
+        self.assertEqual(d["on"], 1)
+        self.assertEqual(d["rk"], 0)
+        self.assertEqual("wr" in d, arm_radio.START_FULL)
         self.assertEqual(d["st"], [7, 7, 0, 3, 0])
         self.assertNotIn("err", d)                # it is in the status instead
         self.assertEqual(d["boot"], 1234)
@@ -565,6 +664,7 @@ class RadioTest(unittest.TestCase):
         server, radio = self.server, self.server.radio
         CLOCK.now = 6 * 3600 * 1000               # 6 hours up
         server.loops, radio.rx, radio.ign = 2000000, 5000, 12
+        radio.rk = 6 * 3600 * 1000 // arm_radio.REKEY_IDLE_MS   # idle all day
         radio.tx_retry, radio.tx_fail, radio.mv = 900, 40, [2500, 700]
         radio.last_rx = CLOCK.now - 123456
         radio.e.stats = lambda: (6000, 6000, 900, 5012, 3)
@@ -572,7 +672,13 @@ class RadioTest(unittest.TestCase):
         server.ev = [[21000, 1, 1], [21500, 0, 2], [21599, 1, 3]]
         d = server.diag()
         self.assertLessEqual(len(arm_radio._dumps([65535, "D", None, d])), 250)
-        for key in arm_radio.DIAG_SPARE + ("rb",):
+        # rk and wr only come with their feature on (IDLE_REKEY, START_FULL).
+        from unittest import mock
+        with mock.patch.multiple(arm_radio, IDLE_REKEY=False, START_FULL=False):
+            d = server.diag()
+        self.assertLessEqual(len(arm_radio._dumps([65535, "D", None, d])), 250)
+        for key in [k for k in arm_radio.DIAG_SPARE if k not in ("rk", "wr")] + \
+                ["rb", "tx"]:
             self.assertIn(key, d)
 
     def _snapshot_due(self):
@@ -587,7 +693,8 @@ class RadioTest(unittest.TestCase):
         with open(arm_radio.DIAG_FILE) as f:
             saved = json.load(f)
         self.assertEqual((saved["boot"], saved["rx"]), (1234, 1))
-        self.assertLess(len(json.dumps([65535, "D", None, saved])), 251)
+        self.assertLessEqual(len(arm_radio._dumps([65535, "D", None, saved])),
+                             250)
         # The file is overwritten in place, never added to.
         self.session.ping()
         self._snapshot_due()
@@ -698,6 +805,51 @@ class RadioTest(unittest.TestCase):
         finally:
             fresh.shutdown()
 
+    def test_recovery_without_the_reboot_stops_after_the_wifi_restart(self):
+        from unittest import mock
+        self._arm_goes_deaf_after_next_request()  # nothing cures it
+        with mock.patch.object(arm_radio, "RECOVER_REBOOT", False):
+            with self.assertRaises(arm_serial.RadioError):
+                self.quiet(self.session.ping)
+        self.assertIsNone(self.server.reboot)        # the arm never moves
+        self.assertEqual(self.server.rc, [1, 0, 1, 0])
+        self.assertIsNone(self.server.rec)
+        self.assertEqual([e[1:] for e in self.server.ev], [[0, 0]])  # not fixed
+        self.assertFalse(os.path.exists(arm_radio.HOLD_FILE))
+
+    def test_unencrypted_link_works_both_ends_and_a_mismatch_does_not(self):
+        cfg_path = os.path.join(self.tmp.name, "arm_radio.json")
+        with open(cfg_path, "w") as f:
+            json.dump(dict(self.CFG, channel=6), f)
+        from unittest import mock
+        with mock.patch.object(arm_radio, "RADIO_FILE", cfg_path):
+            saved = self.session.request(["s", {"channel": 6, "enc": 0}], 5)[1]
+            self.assertEqual(saved["enc"], 0)
+            with self.assertRaises(arm_serial.DeviceError):
+                self.session.request(["s", {"enc": 2}], 5)
+        with open(cfg_path) as f:
+            self.assertEqual(json.load(f)["enc"], 0)
+        # The arm restarts unencrypted (Radio reads "enc": 0); the remote
+        # still encrypted cannot reach it.
+        radio = self.server.radio
+        radio.enc, radio.lmk = 0, None
+        radio.e.peers[REMOTE_MAC] = None
+        with self.assertRaises(arm_serial.RadioError):
+            self.quiet(lambda: self.session.request(["p"], 5, retry=False))
+        # The remote follows (pair "enc": 0 gives the bridge no LMK).
+        self.session.pair["enc"] = 0
+        arm_bridge._bridge = None
+        try:
+            arm_serial.RadioSession._start_bridge(self.session)
+            self.assertIsNone(self.link.ns["_b"].lmk)
+            self.assertEqual(self.session.ping()["boot"], 1234)
+            d = self.session.request(["d"], 5)[1]
+            self.assertEqual(d["en"], 0)
+            self.assertIn("UNENCRYPTED", arm_serial._wifi_text(d))
+        finally:
+            arm_bridge._bridge = None
+        self.assertEqual(arm_radio.Radio(dict(self.CFG, enc=0)).lmk, None)
+
     def _hold(self, boot=1234, snapshot_boot=1234, rb=1):
         with open(arm_radio.HOLD_FILE, "w") as f:
             json.dump({"1": 150, "2": 30, "b": boot}, f)
@@ -780,6 +932,8 @@ class RadioTest(unittest.TestCase):
         self.assertEqual(self.remote_restarts, 1)              # tried once
 
     def test_wrong_key_is_not_heard(self):
+        # Paired with other keys (so re-adding the peer does not cure it).
+        self.server.radio.lmk = b"x" * 16
         self.server.radio.e.peers[REMOTE_MAC] = b"x" * 16
         with self.assertRaises(arm_serial.RadioError):
             self.quiet(self.session.ping)
@@ -796,6 +950,546 @@ class RadioTest(unittest.TestCase):
         for junk in (b"[", b"[1]", b'["x"', b"[1, 2, 3"):
             self.server.handle(junk)
         self.assertEqual(self.session.ping()["boot"], 1234)
+
+    # ------------------------------------------- start-up and one-sided restarts
+
+    CFG = {"peer": PAIR["remote_mac"], "pmk": PAIR["pmk"], "lmk": PAIR["lmk"],
+           "channel": PAIR["channel"]}
+
+    def _restart_arm(self, boot=999):
+        """The arm switched off and on: a new radio and server, same arm."""
+        AIR.next_mac = ARM_MAC
+        self.server = arm_radio.Server(self.arm, arm_radio.Radio(self.CFG), boot)
+
+    def _restart_remote(self):
+        """The remote restarted (e.g. USB unplugged): a new bridge."""
+        AIR.next_mac = REMOTE_MAC
+        self.link.ns["_b"] = arm_bridge.Bridge(PAIR["arm_mac"], PAIR["pmk"],
+                                               PAIR["lmk"], PAIR["channel"])
+
+    def test_arm_switched_off_and_on_while_the_remote_stays_up(self):
+        self.session.ping()
+        self._restart_arm()
+        self.assertEqual(self.session.ping()["boot"], 999)
+        self.assertGreater(AIR.nodes[REMOTE_MAC].stale, 0)   # it was stale
+
+    def test_without_the_bridge_rekey_a_restarted_arm_is_never_heard(self):
+        # What the boards did before: acked, but "no reply from the arm",
+        # and switching the arm off and on again does not help.
+        self.session.ping()
+        self.link.ns["_b"].rekey = lambda: None
+        for boot in (999, 998):
+            self._restart_arm(boot)
+            with self.assertRaises(arm_serial.RadioError) as cm:
+                self.quiet(self.session.ping)
+            self.assertIn("no reply from the arm", str(cm.exception))
+
+    def test_remote_restarted_while_the_arm_stays_up(self):
+        self.session.ping()
+        self._restart_remote()
+        start = CLOCK.now
+        self.assertEqual(self.session.ping()["boot"], 1234)
+        self.assertLess(CLOCK.now - start, arm_bridge.NO_REPLY_MS)
+        self.assertGreater(self.server.radio.rk, 0)          # the arm re-keyed
+        self.assertGreater(AIR.nodes[ARM_MAC].stale, 0)
+
+    def test_without_the_idle_rekey_a_restarted_remote_is_never_heard(self):
+        self.session.ping()
+        self.server.idle_rekey = lambda: None
+        self._restart_remote()
+        with self.assertRaises(arm_serial.RadioError) as cm:
+            self.quiet(self.session.ping)
+        self.assertIn("no reply from the arm", str(cm.exception))
+
+    def test_a_new_session_sets_up_the_link_afresh(self):
+        self.session.ping()
+        self._restart_arm()
+        self.link.ns["_b"].fresh()        # what _start_bridge runs
+        start = CLOCK.now
+        self.assertEqual(self.session.ping()["boot"], 999)
+        self.assertLess(CLOCK.now - start, 100)    # first try, no waiting
+
+    def test_an_old_bridge_on_the_remote_asks_for_radio_pair(self):
+        start = arm_serial.RadioSession._start_bridge
+        key = (PAIR["arm_mac"], PAIR["pmk"], PAIR["lmk"], PAIR["channel"], None)
+        current = self.link.ns["_b"]
+        try:
+            arm_bridge._bridge = types.SimpleNamespace(key=key)   # no fresh()
+            with self.assertRaises(arm_serial.UsageError) as cm:
+                start(self.session)
+            self.assertIn("radio-pair", str(cm.exception))
+            arm_bridge._bridge = current
+            start(self.session)
+            self.assertEqual(self.session.ping()["boot"], 1234)
+        finally:
+            arm_bridge._bridge = None
+
+    def test_a_command_sent_while_the_arm_is_still_starting(self):
+        # Its Wi-Fi is up (so the radio acks) but radio mode is not
+        # listening yet; most of the resends overflow its buffer.
+        start = CLOCK.now
+
+        def idle(node, timeout_ms):
+            if CLOCK.now - start < 7000:
+                CLOCK.advance(timeout_ms)
+            else:
+                self._run_arm(node, timeout_ms)
+        AIR.idle = idle
+        self.assertEqual(self.session.ping()["boot"], 1234)
+        self.assertGreater(AIR.nodes[ARM_MAC].dropped, 0)
+
+    def test_no_acks_at_all_is_no_radio_contact_after_about_5_s(self):
+        AIR.deaf.add(ARM_MAC)
+        start = CLOCK.now
+        with self.assertRaises(arm_serial.RadioError) as cm:
+            self.session.request(["p"], 5, retry=False)
+        self.assertIn("no radio contact", str(cm.exception))
+        self.assertAlmostEqual(CLOCK.now - start, arm_bridge.NO_CONTACT_MS,
+                               delta=400)
+
+    def test_old_replies_in_the_buffer_do_not_crowd_out_the_answer(self):
+        bridge = self.link.ns["_b"]
+        self.assertEqual(bridge.e.room, arm_bridge.RXBUF // MSG_ROOM)
+        old = b'[%d,"D",null]' % bridge.seq          # never the next seq
+        bridge.e.queue.extend([(ARM_MAC, old)] * bridge.e.room)
+        start = CLOCK.now
+        self.assertEqual(self.session.ping()["boot"], 1234)
+        self.assertEqual(bridge.e.dropped, 0)
+        self.assertLess(CLOCK.now - start, 100)
+
+    def test_heartbeat_reaches_the_arm_as_ignored_and_logs_gaps(self):
+        from unittest import mock
+        with mock.patch.object(arm_bridge, "HEARTBEAT_MS", 100):
+            AIR.next_mac = REMOTE_MAC
+            bridge = arm_bridge.Bridge(PAIR["arm_mac"], PAIR["pmk"],
+                                       PAIR["lmk"], PAIR["channel"])
+            self.link.ns["_b"] = bridge
+            radio = self.server.radio
+            for _ in range(10):                      # 10 heartbeats
+                CLOCK.advance(100)
+                for _ in range(3):
+                    self.assertIsNone(radio.recv(0))   # never a request
+            self.assertEqual(bridge.hb, [10, 10])
+            self.assertEqual((radio.ign, radio.rx), (10, 0))
+            # A request still works with heartbeats going.
+            self.assertTrue(self.session.ping())
+            # A deaf arm: heartbeats go unacked; the gap is logged once the
+            # arm acks again.
+            real = bridge.e.send
+            bridge.e.send = lambda mac, msg, sync=True: (
+                False if msg == b"h" else real(mac, msg, sync))
+            start = CLOCK.now
+            CLOCK.advance(2000)
+            self.assertGreaterEqual(json.loads(bridge.hbstat())["run"], 19)
+            bridge.e.send = real
+            CLOCK.advance(200)
+            st = json.loads(bridge.hbstat())
+            self.assertEqual(st["run"], 0)
+            self.assertEqual(len(st["gaps"]), 1)
+            self.assertAlmostEqual(st["gaps"][0][0], start, delta=100)
+            self.assertAlmostEqual(st["gaps"][0][1], 2000, delta=200)
+        for timer in list(CLOCK.timers):
+            if timer.callback == bridge._beat:
+                timer.deinit()
+
+    def test_settings_are_saved_for_the_next_start_and_checked(self):
+        cfg_path = os.path.join(self.tmp.name, "arm_radio.json")
+        cfg = {"peer": PAIR["remote_mac"], "pmk": PAIR["pmk"],
+               "lmk": PAIR["lmk"], "channel": 6}
+        with open(cfg_path, "w") as f:
+            json.dump(cfg, f)
+        from unittest import mock
+        with mock.patch.object(arm_radio, "RADIO_FILE", cfg_path):
+            saved = self.session.request(["s", {"channel": 1, "txpower": 20}], 5)[1]
+            self.assertEqual(saved, {"channel": 1, "txpower": 20, "enc": 1})
+            with open(cfg_path) as f:
+                self.assertEqual(json.load(f), dict(cfg, channel=1, txpower=20))
+            self.assertEqual(self.server.radio.channel, 6)   # only at next start
+            for bad in ({"channel": 14}, {"channel": 1.5}, {"txpower": 30},
+                        {"pmk": "00"}):
+                with self.assertRaises(arm_serial.DeviceError):
+                    self.session.request(["s", bad], 5)
+            with open(cfg_path) as f:
+                self.assertEqual(json.load(f)["channel"], 1)  # unchanged
+        # The next start uses them, and sets the power again after a Wi-Fi
+        # restart.
+        WLAN.reset()
+        AIR.next_mac = ARM_MAC
+        radio = arm_radio.Radio(dict(cfg, channel=1, txpower=20))
+        self.assertEqual((WLAN.ch, WLAN.tx), (1, 20))
+        WLAN.tx = 19.5
+        radio.restart_wifi()
+        self.assertEqual(WLAN.tx, 20)
+        d = self.server.diag()
+        self.assertIn("tx", d)
+        self.assertIn("transmit power", arm_serial._wifi_text({"tx": 20.0}))
+
+    def test_radio_set_moves_both_boards_and_falls_back(self):
+        from unittest import mock
+        saved = []
+        with mock.patch.object(arm_serial, "save_pair", saved.append):
+            # The arm "restarts" on its new settings: a new boot id.
+            def run_s(op, args, real=self.server.run):
+                if op == "s":
+                    return {"channel": args[0]["channel"],
+                            "txpower": args[0].get("txpower")}
+                if op == "r":
+                    self.server.boot += 1
+                    return None
+                return real(op, args)
+            self.server.run = run_s
+            starts = []
+            self.session._start_bridge = lambda: starts.append(
+                (self.session.pair["channel"], self.session.pair.get("txpower")))
+            self.session.set_radio(1, 20)
+            self.assertEqual(starts, [(1, 20)])
+            self.assertEqual(saved[-1]["channel"], 1)
+            self.assertEqual(saved[-1]["txpower"], 20)
+            # No answer on the new settings: the remote goes back.
+            self.session.pair.update(channel=6)
+            self.session.pair.pop("txpower")
+            saved.clear()
+            starts.clear()
+            self.server.run = lambda op, args: (
+                {"channel": 3, "txpower": None} if op == "s" else None)
+            times = iter(range(0, 10000, 30))
+            with mock.patch.object(arm_serial.time, "monotonic",
+                                   lambda: next(times)), \
+                    mock.patch.object(arm_serial.time, "sleep", lambda s: None), \
+                    self.assertRaises(arm_serial.RadioError) as cm:
+                self.session.set_radio(3)
+            self.assertIn("back on channel 6", str(cm.exception))
+            self.assertEqual(starts, [(3, None), (6, None)])
+            self.assertEqual(saved, [])
+            self.assertNotIn("txpower", self.session.pair)
+
+    def test_memory_reports_the_low_points_and_when(self):
+        server = self.server
+        server.mem_sample()                       # due at once
+        CLOCK.now += 500
+        esp32.heap = [(121072, 900, 512, 800), (116496, 100, 64, 90)]
+        server.mem_sample()                       # not due yet: not seen
+        CLOCK.now += 600
+        server.mem_sample()
+        low_at = CLOCK.now
+        esp32.heap = [(121072, 19116, 18432, 800), (116496, 10144, 9728, 90)]
+        CLOCK.now += 2000
+        server.mem_sample()
+        m = self.session.request(["m"], 5)[1]
+        self.assertEqual(m["sys"], [29260, 1000, low_at])
+        self.assertEqual(m["gc"][:3], [51234, 40000, 51234])
+        self.assertEqual(m["hp"][1], [116496, 10144, 9728, 90])
+        text = "\n".join(arm_serial.describe_memory(m))
+        self.assertIn("system heap (Wi-Fi buffers) 28.6 KB free, lowest 1.0 KB", text)
+        self.assertIn("lowest since boot 0.1 KB", text)
+        self.assertEqual(arm_serial.describe_memory(None), [])
+        # A firmware without esp32.idf_heap_info still answers.
+        real = esp32.idf_heap_info
+        esp32.idf_heap_info = None
+        try:
+            m = self.server.memory()
+            self.assertIsNone(m["sys"][0])
+            self.assertIn("TypeError", m["hp"])
+            self.assertIn("regions not readable", "\n".join(
+                arm_serial.describe_memory(m)))
+        finally:
+            esp32.idf_heap_info = real
+            esp32.heap = [(121072, 19116, 18432, 19088), (116496, 10144, 9728, 9920)]
+
+    def _arm_in_test_mode(self, seconds, echo=1):
+        """The arm as it runs after restarting into radio test mode."""
+        tester = arm_radio.RadioTest(self.server.radio, seconds, echo)
+
+        def idle(node, timeout_ms):
+            end = CLOCK.now + timeout_ms
+            while CLOCK.now < end:
+                tester.step(0)
+                if node.queue:
+                    return
+                CLOCK.advance(1)
+        AIR.idle = idle
+        return tester
+
+    def test_radio_test_counts_what_gets_through(self):
+        tester = self._arm_in_test_mode(6)
+        # Lose everything from the remote for 1.5 s, two seconds in.
+        t0 = CLOCK.now
+        AIR.drop = lambda mac, msg: (mac == REMOTE_MAC and msg[:1] == b"T"
+                                     and 2300 <= CLOCK.now - t0 < 3800)
+        remote = json.loads(self.link.ns["_b"].rtest(6, 50, 1))
+        AIR.drop = None
+        while not tester.done():
+            CLOCK.advance(10)
+        arm = tester.result()
+        self.assertEqual(remote["n"], 5)
+        sent = sum(remote["sent"])
+        self.assertGreater(sent, 230)                       # about 50 a second
+        self.assertEqual(sum(remote["ack"]), sent)          # dropped, still acked
+        self.assertAlmostEqual(sum(remote["back"]), sent - 75, delta=5)
+        self.assertAlmostEqual(remote["echo_gap"][0], 1500, delta=60)
+        self.assertEqual(arm["rx"], arm["ok"])
+        self.assertAlmostEqual(arm["lost"], 75, delta=3)
+        self.assertAlmostEqual(arm["gap"][0], 1500, delta=60)
+        text = "\n".join(arm_serial.describe_radio_test(remote, arm))
+        self.assertIn("acked by the arm's radio", text)
+        self.assertIn("missed by sequence number", text)
+        # Requests and heartbeats are not test packets: counted as ignored.
+        before = tester.res["ign"]
+        self.server.radio.e.queue.append((REMOTE_MAC, b"h"))
+        tester.step(0)
+        self.assertEqual(tester.res["ign"], before + 1)
+
+    def test_radio_test_waits_for_the_arm_and_gives_up(self):
+        # The arm never enters test mode (normal radio mode ignores "T").
+        remote = json.loads(self.link.ns["_b"].rtest(5, 50, 1, wait_ms=1000))
+        self.assertIn("no echo from the arm's test mode", remote["err"])
+
+    def test_radio_test_runs_once_and_never_after_power_on(self):
+        from unittest import mock
+        tmp = self.tmp.name
+        cfg_path = os.path.join(tmp, "arm_radio.json")
+        with open(cfg_path, "w") as f:
+            json.dump(self.CFG, f)
+        test_file = os.path.join(tmp, "arm_rtest")
+        result = os.path.join(tmp, "arm_rtest.json")
+        prev = os.path.join(tmp, "arm_rtest_prev.json")
+        with mock.patch.multiple(arm_radio, RADIO_FILE=cfg_path, TEST_FILE=test_file,
+                                 TEST_RESULT=result, TEST_PREV=prev):
+            # "t" saves the request and restarts the arm.
+            with self.assertRaises(arm_serial.DeviceError):
+                self.session.request(["t", 0], 5)
+            reply = self.session.request(["t", 2], 5)[1]
+            self.assertEqual(reply["s"], 2)
+            self.assertEqual(self.server.reboot, "radio")
+            with open(test_file) as f:
+                self.assertEqual(json.load(f)["s"], 2)
+            # Each simulated start makes a new radio; put the boards back after.
+            nodes = dict(AIR.nodes)
+
+            def start(*args):
+                AIR.next_mac = ARM_MAC
+                try:
+                    arm_radio.run("no_such_arm_library", *args)
+                finally:
+                    AIR.nodes.clear()
+                    AIR.nodes.update(nodes)
+            # After power-on: the request is dropped, radio mode as usual.
+            ready = []
+            with mock.patch.object(machine, "reset_cause", lambda: machine.PWRON_RESET), \
+                    self.assertRaises(ImportError):
+                start(lambda: ready.append(1))
+            self.assertFalse(os.path.exists(test_file))
+            self.assertFalse(os.path.exists(result))
+            self.assertFalse(os.path.exists(prev))
+            # After the restart "t" asks for: the test runs for its time,
+            # saves the result and restarts (into radio mode: the file is gone).
+            test_id = self.session.request(["t", 2], 5)[1]["id"]
+            t0 = CLOCK.now
+            with self.assertRaises(SystemExit):              # machine.reset()
+                start(lambda: ready.append(1))
+            self.assertGreaterEqual(CLOCK.now - t0, 2000)
+            self.assertFalse(os.path.exists(test_file))
+            with open(result) as f:
+                saved = json.load(f)
+            self.assertEqual((saved["s"], saved["rx"], len(saved["per"])), (2, 0, 2))
+            self.assertEqual(saved["id"], test_id)
+            self.assertEqual(saved["w0"][0:2], [1, 6])
+            self.assertEqual(ready, [1])     # only the test start got that far
+            # Read back in pieces, as the PC does.
+            self.assertEqual(self.session.test_result(), saved)
+            self.assertIsNone(self.session.test_result(prev=True))
+            # A second test keeps the first result as the one before.
+            second = self.session.request(["t", 2], 5)[1]["id"]
+            with self.assertRaises(SystemExit):
+                start()
+            self.assertEqual(self.session.test_result()["id"], second)
+            self.assertEqual(self.session.test_result(prev=True), saved)
+            # Any later start is radio mode again.
+            with self.assertRaises(ImportError):
+                start()
+
+    def test_radio_test_reports_a_silent_arm(self):
+        # In normal radio mode the arm ignores test packets: its radio acks
+        # them, but nothing comes back.
+        remote = json.loads(self.link.ns["_b"].rtest(5, 50, 1, wait_ms=1000))
+        self.assertEqual(remote["err"], "no echo from the arm's test mode")
+        self.assertGreater(remote["wait_sent"], 0)
+        self.assertEqual(remote["wait_ack"], remote["wait_sent"])
+        text = "\n".join(arm_serial.describe_radio_test(remote, None))
+        self.assertIn("its radio heard them; nothing came back", text)
+        AIR.deaf.add(ARM_MAC)
+        remote = json.loads(self.link.ns["_b"].rtest(5, 50, 1, wait_ms=1000))
+        self.assertEqual(remote["wait_ack"], 0)
+        self.assertIn("no radio contact", "\n".join(
+            arm_serial.describe_radio_test(remote, None)))
+        # The arm's own record still shows its Wi-Fi state at the start.
+        arm = {"s": 2, "e": 1, "rx": 0, "lost": 0, "ok": 0, "nak": 0, "ign": 0,
+               "first": None, "gap": [0, 0], "per": [0, 0], "id": 7,
+               "w0": [1, 1, 1000, "", 1, 1]}
+        text = "\n".join(arm_serial.describe_radio_test(remote, arm))
+        self.assertIn("Arm Wi-Fi as the test started: station on, channel 1, idle; "
+                      "access point on, channel 1", text)
+        self.assertIn("seconds with nothing: 0-1", text)
+
+    def test_messages_stay_within_the_esp_now_limit(self):
+        # A request over 250 bytes is refused with a clear error on the remote.
+        with self.assertRaises(arm_serial.DeviceError) as cm:
+            self.session.request(["c", "move_to", ["x" * 300], {}, 5], 5)
+        self.assertIn("request too long", str(cm.exception))
+        # The biggest real request: one update chunk.
+        b64 = "A" * (4 * ((arm_serial.RADIO_CHUNK + 2) // 3))
+        self.assertLessEqual(len("[%d, %s" % (65535, json.dumps(["fw", b64])[1:])), 250)
+        # A test-result piece fits even if it is all quotes.
+        worst = '"' * arm_radio.TEST_CHUNK
+        self.assertLessEqual(len(arm_radio._dumps(
+            [65535, "D", None, {"n": 99999, "d": worst}])), arm_radio.MAX_MSG)
+
+    def test_arm_receive_buffer_is_2048_on_every_start(self):
+        # Plain start-up (radio mode and radio test mode both start this way)
+        # and after a recovery step: the same buffer as the remote.
+        self.assertEqual(arm_radio.RXBUF, arm_bridge.RXBUF)
+        WLAN.reset()
+        AIR.next_mac = ARM_MAC
+        radio = arm_radio.Radio(self.CFG)
+        self.assertEqual(radio.e.rxbuf, 2048)
+        radio.restart_espnow()
+        self.assertEqual(radio.e.rxbuf, 2048)
+        radio.restart_wifi()
+        self.assertEqual(radio.e.rxbuf, 2048)
+
+    def test_idle_rekey_switched_off_never_runs(self):
+        from unittest import mock
+        CLOCK.advance(10 * arm_radio.REKEY_IDLE_MS)
+        with mock.patch.object(arm_radio, "IDLE_REKEY", False):
+            self.server.idle_rekey()
+        self.assertEqual(self.server.radio.rk, 0)
+
+    def test_idle_rekey_waits_for_quiet_and_never_runs_during_a_move(self):
+        radio = self.server.radio
+        self.session.ping()
+        CLOCK.advance(arm_radio.REKEY_IDLE_MS - 100)
+        self.server.idle_rekey()
+        self.assertEqual(radio.rk, 0)                 # heard just now
+        self.arm.move_arm(150, 150, speed=1, wait=False)
+        CLOCK.now += 10 * arm_radio.REKEY_IDLE_MS     # (timers not run)
+        self.server.idle_rekey()
+        self.assertEqual(radio.rk, 0)                 # moving
+        self.arm.hold_joints()
+        self.server.idle_rekey()
+        self.assertEqual(radio.rk, 1)
+        self.server.idle_rekey()
+        self.assertEqual(radio.rk, 1)                 # once per REKEY_IDLE_MS
+        CLOCK.now += arm_radio.REKEY_IDLE_MS
+        self.server.idle_rekey()
+        self.assertEqual(radio.rk, 2)
+
+    def _full_start(self):
+        """The arm's start-up with every step (arm_radio.START_*) on."""
+        from unittest import mock
+        return mock.patch.multiple(arm_radio, START_FULL=True, START_PM=True,
+                                   START_RXBUF=True)
+
+    def test_start_up_with_every_step_puts_wifi_in_a_known_state(self):
+        # setUp started the remote from what the stock firmware leaves:
+        # station and access point on, power saving on. It always does the
+        # full start; the arm only with START_*.
+        self.assertEqual(self.link.ns["_b"].wr, 1)
+        self.assertFalse(os.path.exists(arm_bridge.WIFI_MARK))
+        WLAN.reset()
+        AIR.next_mac = ARM_MAC
+        with self._full_start():
+            radio = arm_radio.Radio(self.CFG)
+        self.assertTrue(WLAN.on)
+        self.assertEqual(WLAN.ch, PAIR["channel"])
+        self.assertEqual(WLAN.pm, WLAN.PM_NONE)
+        self.assertIn((0, False), WLAN.log)           # switched off and on
+        self.assertNotIn((1, False), WLAN.log)        # AP left alone
+        self.assertEqual(radio.wr, 1)
+        self.assertFalse(os.path.exists(arm_radio.WIFI_MARK))
+        self.assertEqual(radio.e.room, arm_radio.RXBUF // MSG_ROOM)
+
+    def test_arm_start_up_by_default_is_the_one_from_before(self):
+        # Every START_* step off (2026-11-22: finding which one leaves the
+        # arm deaf after power-on): Wi-Fi only switched on if it is off,
+        # power saving and the receive buffer as the firmware left them.
+        from unittest import mock
+        off = mock.patch.multiple(arm_radio, START_FULL=False, START_PM=False,
+                                  START_RXBUF=False)
+        off.start()
+        self.addCleanup(off.stop)
+        WLAN.reset()
+        AIR.next_mac = ARM_MAC
+        radio = arm_radio.Radio(self.CFG)
+        self.assertEqual(WLAN.log, [])                # already on: not touched
+        self.assertEqual(WLAN.ch, PAIR["channel"])
+        self.assertEqual(WLAN.pm, 1)
+        self.assertEqual(radio.wr, 0)
+        self.assertFalse(os.path.exists(arm_radio.WIFI_MARK))
+        self.assertEqual(radio.e.room, 2)             # the firmware's default
+        # Off at start: switched on.
+        WLAN.reset()
+        WLAN.on = False
+        AIR.next_mac = ARM_MAC
+        arm_radio.Radio(self.CFG)
+        self.assertEqual(WLAN.log, [(0, True)])
+        self.assertEqual(WLAN.ch, PAIR["channel"])
+
+    def test_a_wifi_start_that_hung_makes_the_next_start_gentle(self):
+        from unittest import mock
+
+        class Hang(BaseException):
+            """Stands in for active() never returning."""
+
+        real = WLAN.active
+
+        def hangs(wlan, on=None):
+            if wlan._if == 0 and on is False:
+                raise Hang
+            return real(wlan, on)
+
+        WLAN.reset()
+        AIR.next_mac = ARM_MAC
+        with mock.patch.object(WLAN, "active", hangs), self.assertRaises(Hang), \
+                self._full_start():
+            arm_radio.Radio(self.CFG)
+        self.assertTrue(os.path.exists(arm_radio.WIFI_MARK))
+        # Switched off and on by hand: the gentle way, from now on.
+        WLAN.reset()
+        for _ in range(2):
+            with self._full_start():
+                radio = arm_radio.Radio(self.CFG)
+            self.assertEqual(radio.wr, 0)
+            self.assertTrue(os.path.exists(arm_radio.WIFI_MARK))
+        self.assertNotIn((0, False), WLAN.log)        # station never cycled
+        self.assertEqual(WLAN.pm, WLAN.PM_NONE)       # still set
+        self.assertEqual(WLAN.ch, PAIR["channel"])
+        self.assertIn("gentle start", arm_serial._wifi_text({"wr": 0}))
+
+    def test_a_board_whose_wifi_would_be_off_fails_at_start_up(self):
+        from unittest import mock
+        # On this firmware switching the access point off stops Wi-Fi (the
+        # start-up once did that last, and both boards went deaf on channel 1).
+        network.WLAN(network.AP_IF).active(False)
+        self.assertFalse(network.WLAN(network.STA_IF).active())
+        # A station that will not come on: each board refuses to start
+        # rather than look alive, and it is not taken for a hang.
+        real = WLAN.active
+
+        def stays_off(wlan, on=None):
+            return real(wlan, on) if on is None else real(wlan, False)
+
+        for mac, start in (
+                (ARM_MAC, lambda: arm_radio.Radio(self.CFG)),
+                (REMOTE_MAC, lambda: arm_bridge.Bridge(
+                    PAIR["arm_mac"], PAIR["pmk"], PAIR["lmk"], PAIR["channel"]))):
+            WLAN.reset()
+            AIR.next_mac = mac
+            with mock.patch.object(WLAN, "active", stays_off), \
+                    self.assertRaises(OSError) as cm, self._full_start():
+                start()
+            self.assertIn("did not start on channel 6", str(cm.exception))
+        self.assertFalse(os.path.exists(arm_radio.WIFI_MARK))
+        self.assertFalse(os.path.exists(arm_bridge.WIFI_MARK))
 
     # ----------------------------------------------------------- calibration
 
@@ -1331,6 +2025,8 @@ class BootHookTest(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         arm_boot.COUNT_FILE = os.path.join(self.tmp.name, "arm_boot")
+        arm_boot.MODE_FILE = os.path.join(self.tmp.name, "arm_mode")
+        arm_boot.COLD_MARK = os.path.join(self.tmp.name, "arm_cold")
         self.tried = []
 
     def tearDown(self):
@@ -1399,6 +2095,61 @@ class BootHookTest(unittest.TestCase):
             machine.reset_cause = real
         self.assertEqual(self.tried, [])
 
+    def _remote_boot(self, cause):
+        """One boot of the remote in bridge mode; True if it restarted."""
+        real_cause, real_role = machine.reset_cause, Pin.role
+        machine.reset_cause = lambda: cause
+        Pin.role = 1
+        try:
+            with contextlib.redirect_stdout(io.StringIO()):
+                arm_boot.main()
+            return False
+        except SystemExit:
+            return True
+        finally:
+            machine.reset_cause, Pin.role = real_cause, real_role
+
+    def _bridge_mode(self):
+        with open(arm_boot.MODE_FILE, "w") as f:
+            f.write("bridge")
+
+    def test_a_remote_switched_on_restarts_once(self):
+        self._bridge_mode()
+        self.assertTrue(self._remote_boot(machine.PWRON_RESET))
+        self.assertTrue(os.path.exists(arm_boot.COLD_MARK))
+        # The boot after the restart carries on, and clears the mark.
+        self.assertFalse(self._remote_boot(machine.HARD_RESET))
+        self.assertFalse(os.path.exists(arm_boot.COLD_MARK))
+        # Other restarts are left alone.
+        self.assertFalse(self._remote_boot(machine.HARD_RESET))
+
+    def test_the_power_on_restart_cannot_loop(self):
+        self._bridge_mode()
+        # Even if every boot read as a power-on: restart, carry on, ...
+        got = [self._remote_boot(machine.PWRON_RESET) for _ in range(4)]
+        self.assertEqual(got, [True, False, True, False])
+        # ...and with no room for the mark, no restart at all.
+        from unittest import mock
+        with mock.patch.object(arm_boot, "_write", lambda path, text: None):
+            self.assertFalse(self._remote_boot(machine.PWRON_RESET))
+
+    def test_the_arm_does_not_restart_after_a_power_on(self):
+        # Its radio is fine from power-on, and _receiver needs to see the
+        # power-on to tell switching off and on from a crash.
+        self._bridge_mode()
+        arm_boot.TRIES = (("arm_radio_fake", "lib"),)
+        self._modules(set())
+        real_cause, real_role = machine.reset_cause, Pin.role
+        machine.reset_cause = lambda: machine.PWRON_RESET
+        Pin.role = 0
+        try:
+            with contextlib.redirect_stdout(io.StringIO()):
+                arm_boot.main()
+        finally:
+            machine.reset_cause, Pin.role = real_cause, real_role
+        self.assertEqual(self.tried, [("arm_radio_fake", "lib")])
+        self.assertFalse(os.path.exists(arm_boot.COLD_MARK))
+
     def test_everything_broken_means_stock(self):
         arm_boot.TRIES = (("arm_radio_fake", "lib"),)
         self._modules({("arm_radio_fake", "lib")})
@@ -1407,13 +2158,44 @@ class BootHookTest(unittest.TestCase):
         self.assertFalse(os.path.exists(arm_boot.COUNT_FILE))   # try again next boot
 
 
+class EnsureBridgeTest(unittest.TestCase):
+    """What the PC does to the remote before it makes the bridge."""
+
+    def _run(self, state):
+        link = types.SimpleNamespace(exec=lambda code, timeout=30: state + "\n")
+        session = arm_serial.RadioSession(link, dict(PAIR))
+        restarts, started = [], []
+        session._reboot_remote = lambda: restarts.append(1)
+        session._start_bridge = lambda: started.append(1)
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            session._ensure_bridge()
+        return len(restarts), started, out.getvalue()
+
+    def test_a_remote_just_switched_on_is_restarted_once_first(self):
+        # Its radio is bad until the chip restarts (see _ensure_bridge).
+        restarts, started, text = self._run("1 0 0 1")
+        self.assertEqual((restarts, started), (1, [1]))
+        self.assertIn("just switched on", text)
+
+    def test_a_restarted_remote_is_used_as_it_is(self):
+        self.assertEqual(self._run("1 0 0 0")[:2], (0, [1]))
+
+    def test_a_soft_reset_remote_is_restarted(self):
+        restarts, started, text = self._run("1 0 1 0")
+        self.assertEqual((restarts, started), (1, [1]))
+        self.assertIn("soft-reset", text)
+
+
 class CompileTest(unittest.TestCase):
     """Every board file compiles for MicroPython 1.23 and stays small."""
 
     # arm_radio: 6000 -> 7500 for the radio diagnostics, recovery and joint
     # hold (the snapshot part is meant to come out again once the radio
     # fault is understood). The arm had 55 KB of RAM free with it at 6.5 KB.
-    BUDGET = {"cyberbrick_arm": 9000, "arm_radio": 7500, "arm_bridge": 2000,
+    # 7500 -> 8500 for the Wi-Fi reset at start-up and the idle re-key
+    # (7.8 KB); the larger receive buffer costs another ~0.5 KB of RAM.
+    BUDGET = {"cyberbrick_arm": 9000, "arm_radio": 11500, "arm_bridge": 3600,
               "arm_boot": 2000}
 
     def test_sizes(self):

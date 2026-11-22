@@ -86,8 +86,9 @@ use `cyberbrick_arm_status`.)
 
 | Error says                                  | Do this                                                       |
 | ------------------------------------------- | ------------------------------------------------------------- |
-| radio error: no reply from the arm          | The arm's radio hears the remote but radio mode is not answering. If `remote` was used, the arm stays in stick mode until it is switched off and on; otherwise ask the user to switch the arm off and on. |
-| radio error: no radio contact with the arm  | The driver already restarted the remote once. Ask the user to check the arm is switched on and to move the remote closer. |
+| radio error: no reply from the arm          | The arm's radio hears the remote but nothing came back for 10 s, even after the link was set up again. If `remote` was used, the arm stays in stick mode until it is switched off and on; otherwise run `arm_serial.py debug` first, then ask the user to switch the arm off and on. |
+| radio error: no radio contact with the arm  | The driver already restarted the remote once. Ask the user to check the arm is switched on and to move the remote closer. If it is on, this is probably a deaf spell (below): wait a minute or two and try once more. |
+| request too long                            | A request over ESP-NOW's 250-byte limit was refused; nothing was sent. Use shorter arguments. |
 | Could not find the CyberBrick remote        | USB must go to the paired remote. Set `--port` / the plugin's `port` if needed. |
 | needs USB in the CyberBrick remote ... this board is a receiver | The cable is in the arm; move it to the remote. |
 | The bridge is not installed on this remote  | The user runs `arm_serial.py radio-pair` with USB in the remote. |
@@ -99,6 +100,28 @@ use `cyberbrick_arm_status`.)
 | timed out                                   | Call `cyberbrick_arm_restart` once, then retry the command once. |
 
 Do not retry a failing command more than once; report the error and the fix to the user.
+
+## Radio deaf spells (known problem)
+
+The radio link has intermittent "deaf spells": for a few seconds up to about two minutes
+the arm's radio acknowledges nothing, although the arm keeps running. Commands are then
+slow or fail with "no radio contact" / "no reply from the arm", and work again afterwards.
+No setting tried so far cures them (details in `src/README.md`, "Known problem: deaf
+spells"). The arm recovers by restarting its ESP-NOW and Wi-Fi; it never restarts itself,
+so nothing moves on its own.
+
+- Tell the user what happened; suggest waiting a minute or two, then retry once.
+- `arm_serial.py debug` (read-only) shows the heartbeat gaps and recovery incidents.
+- Moving the remote closer does not help: the signal is strong when it happens.
+
+## Radio settings and tests (the user runs these)
+
+- `arm_serial.py radio-set CHANNEL [TXPOWER] [--plain|--encrypted]` moves both boards to
+  another channel, power or encryption over the radio; no USB in the arm. `--plain`
+  removes the encryption and is for testing only.
+- `arm_serial.py radio-test SECONDS [RATE]` measures the bare link. The arm's servos are
+  not driven during it and it restarts at the end, so only run it when the user asks and
+  the arm is resting.
 
 ## After editing cyberbrick_arm.py
 

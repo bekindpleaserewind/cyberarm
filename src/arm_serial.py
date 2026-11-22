@@ -79,6 +79,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 DEVICE_LIB = os.path.join(HERE, "cyberbrick_arm.py")
 PORT_CACHE = os.path.join(HERE, ".port_cache")
 STATE_FILE = os.path.join(HERE, ".arm_state.json")
+RADIO_TEST_FILE = os.path.join(HERE, ".radio_test_last.json")   # last radio-test data
 BAUD = 115200
 ESP32_C3_USB = (0x303A, 0x1001)
 
@@ -102,6 +103,7 @@ BRIDGE_PATH = "/arm_bridge.mpy"
 BOOT_PATH = "/lib/rc_main.mpy"       # found before the stock /app/rc_main.py
 RADIO_CONFIG = "/arm_radio.json"
 MODE_FILE, COUNT_FILE = "/arm_mode", "/arm_boot"
+WIFI_MARK = "/arm_wifi_try"          # left by a Wi-Fi start that hung the board
 RADIO_CHANNEL = 1
 RADIO_CHUNK = 150                    # file bytes per radio message (250 max)
 
@@ -851,7 +853,7 @@ class ArmSession:
                   "lmk": pair["lmk"], "channel": pair["channel"]}
         self.write_file(RADIO_CONFIG, json.dumps(config).encode())
         self.install_boot_hook(board_mpy)
-        self.remove_files(MODE_FILE, COUNT_FILE)
+        self.remove_files(MODE_FILE, COUNT_FILE, WIFI_MARK)
 
         pair["arm_mac"] = self.board_mac()
         pair["arm_mpy"] = board_mpy
@@ -967,7 +969,8 @@ class RadioSession:
             "except OSError:\n"
             " _i = 0\n"
             "print(_i, int('rc_module' in sys.modules),\n"
-            "      int(machine.reset_cause() == machine.SOFT_RESET))\n"
+            "      int(machine.reset_cause() == machine.SOFT_RESET),\n"
+            "      int(machine.reset_cause() == machine.PWRON_RESET))\n"
             "del _i").split()
         if state[0] != "1":
             raise UsageError("The bridge is not installed on this remote. Run "
@@ -983,12 +986,33 @@ class RadioSession:
             print("The remote was soft-reset, which leaves its radio unable to "
                   "send; restarting it...")
             self._reboot_remote()
+        elif state[3:] == ["1"]:
+            # Started from power-on (plugged in, or switched on): its radio
+            # loses more and more messages, from about 1 in 10 at first to
+            # every one within 2 minutes, at any transmit power, and Wi-Fi
+            # off and on does not cure it. A restart of the chip does
+            # (measured on the remote: 0 of 250 acked before, 248 after).
+            print("The remote was just switched on, and its radio only works "
+                  "properly after one restart; restarting it...")
+            self._reboot_remote()
         self._start_bridge()
 
     def _start_bridge(self):
+        # fresh(): the arm may have been switched off and on since the last
+        # command, while the remote stayed powered over USB.
         p = self.pair
-        self.link.exec(f"import arm_bridge\n_b = arm_bridge.get({p['arm_mac']!r}, "
-                       f"{p['pmk']!r}, {p['lmk']!r}, {p['channel']!r})", timeout=15)
+        out = self.link.exec(
+            f"import arm_bridge\n_b = arm_bridge.get({p['arm_mac']!r}, "
+            f"{p['pmk']!r}, {p['lmk'] if p.get('enc', 1) else None!r}, "
+            f"{p['channel']!r}"
+            + (f", {p['txpower']!r}" if p.get("txpower") is not None else "")
+            + ")\n"
+            "print(int(hasattr(_b, 'fresh')))", timeout=15)
+        if out.strip().splitlines()[-1:] != ["1"]:
+            raise UsageError(
+                "The bridge on the remote is older than this arm_serial.py. "
+                "With USB in the remote, run:\n  python arm_serial.py radio-pair")
+        self.link.exec("_b.fresh()", timeout=15)
 
     # ------------------------------------------------------------- the link
 
@@ -996,16 +1020,22 @@ class RadioSession:
         """Send one request to the arm; returns (status, result)."""
         text = json.dumps(body)[1:]          # the bridge adds "[seq, "
         try:
+            # The bridge waits up to 10 s for a first answer (NO_REPLY_MS),
+            # then timeout_s + 3 s more for the arm to finish.
             out = self.link.exec(
                 f"print(_b.call({text!r}, {int(timeout_s * 1000) + 3000}))",
-                timeout=timeout_s + 15)
+                timeout=timeout_s + 25)
         except DeviceError as e:
             error = str(e).splitlines()[-1]
+            if "request too long" in error:
+                raise DeviceError(error)        # nothing was sent
             if "no radio contact" not in error:
                 raise RadioError(
-                    f"{error}.\nThe arm's radio hears the remote, but radio mode is "
-                    "not answering. After 'remote' it stays in stick mode until it "
-                    "is switched off and on again; otherwise switch it off and on.")
+                    f"{error}.\nThe arm's radio hears the remote, but nothing came "
+                    "back for 10 s, even after the remote set up the link again.\n"
+                    "Run 'debug' now, before switching anything off; then switch "
+                    "the arm off and on. (After 'remote' the arm stays in stick "
+                    "mode until it is switched off and on.)")
             if not retry:
                 raise RadioError(
                     "no radio contact with the arm, even after restarting the "
@@ -1044,7 +1074,9 @@ class RadioSession:
         time.sleep(2)
         while time.monotonic() < deadline:
             try:
-                status = self.ping()
+                # No remote restart while the arm is still starting up: its
+                # silence then is expected, not a jammed remote.
+                status = self.request(["p"], 5, retry=False)[0]
             except (RadioError, DeviceError):
                 continue
             if status.get("boot") != old:
@@ -1142,6 +1174,133 @@ class RadioSession:
             self.reboot("radio")
             print("Arm restarted with the new code:", _public(self.last_status))
 
+    def set_radio(self, channel, txpower=None, enc=None):
+        """Move both boards to another channel, transmit power and/or
+        encryption (enc 0: unencrypted, a test setting).
+
+        The arm saves the settings, restarts on them, and the remote follows.
+        If the arm does not answer on the new settings, the remote goes back
+        to the old ones (the arm may then still be starting, or be in a deaf
+        spell: try 'ping' again later, with 'radio-set' to the side it is on).
+        """
+        new = {"channel": int(channel)}
+        if txpower is not None:
+            new["txpower"] = txpower
+        if enc is not None:
+            new["enc"] = int(enc)
+        old = {"channel": self.pair["channel"], "txpower": self.pair.get("txpower"),
+               "enc": self.pair.get("enc", 1)}
+        status = self.last_status or self.ping()
+        boot = status.get("boot")
+        try:
+            saved = self.request(["s", new], 5)[1]
+        except DeviceError as e:
+            if "unknown op" in str(e):
+                raise UsageError("The arm's radio code is older; run 'update' first.")
+            raise
+        print(f"The arm saved channel {saved['channel']}, transmit power "
+              f"{saved['txpower'] if saved['txpower'] is not None else 'default'}, "
+              f"{'encrypted' if saved.get('enc', 1) else 'UNENCRYPTED'}; "
+              "restarting it...")
+        self.request(["r", "radio"], 5)
+        self.pair.update(new)
+        self._start_bridge()
+        print(f"Remote on channel {self.pair['channel']}; waiting for the arm...")
+        deadline = time.monotonic() + 120
+        time.sleep(2)
+        while time.monotonic() < deadline:
+            try:
+                status = self.request(["p"], 5, retry=False)[0]
+            except (RadioError, DeviceError):
+                continue
+            if status.get("boot") != boot:
+                save_pair(self.pair)
+                self._restore_state(status)
+                print("The arm answers on the new settings.")
+                return status
+        self.pair.update(old)
+        if old["txpower"] is None:
+            self.pair.pop("txpower", None)
+        self._start_bridge()
+        raise RadioError(
+            f"the arm did not answer on channel {new['channel']} within 2 minutes; "
+            f"the remote is back on channel {old['channel']}.\nThe arm saved "
+            f"channel {saved['channel']}: try 'ping'; if it does not answer, run "
+            f"'radio-set {saved['channel']}' to move the remote there.")
+
+    def radio_test(self, seconds, rate=50, echo=True):
+        """Radio test: the arm restarts into its test mode (only the radio
+        runs) for `seconds`, the remote sends numbered packets `rate` times a
+        second and counts what gets through, then the arm restarts into
+        radio mode and its own counts are read. Prints a summary and saves
+        the raw data in RADIO_TEST_FILE, also when the arm stayed silent;
+        returns {"id", "remote", "arm"}. Raises RadioError afterwards if the
+        remote heard nothing from the test."""
+        status = self.last_status or self.ping()
+        boot = status.get("boot")
+        try:
+            reply = self.request(["t", int(seconds), int(bool(echo))], 5)[1]
+        except DeviceError as e:
+            if "unknown op" in str(e):
+                raise UsageError("The arm's radio code is older; run 'update' first.")
+            raise
+        test_id = (reply or {}).get("id")
+        print(f"The arm restarts into radio-test mode for {seconds} s, then back "
+              "into radio mode.\nIts servos are not driven during the test, and "
+              "it restarts at the end.")
+        out = self.link.exec(f"print(_b.rtest({int(seconds)}, {int(rate)}, "
+                             f"{int(bool(echo))}))", timeout=seconds + 45)
+        remote = json.loads(out.strip().splitlines()[-1])
+        print("Waiting for the arm to restart into radio mode...")
+        # After a silent test the arm is still in test mode for up to
+        # `seconds`; it restarts into radio mode by itself after that.
+        deadline = time.monotonic() + seconds + 60
+        status = None
+        while time.monotonic() < deadline:
+            try:
+                status = self.request(["p"], 5, retry=False)[0]
+            except (RadioError, DeviceError):
+                continue
+            if status.get("boot") != boot:
+                break
+            status = None
+            time.sleep(1)
+        arm = None
+        if status is None:
+            print("The arm did not answer in radio mode in time (it may be in a "
+                  "deaf spell); its result stays saved on it: run "
+                  "'radio-test-result' later.")
+        else:
+            self._restore_state(status)
+            arm = self.test_result()
+            if arm is not None and test_id is not None and arm.get("id") != test_id:
+                print("The arm's saved result is from an earlier test: this test "
+                      "saved none.")
+                arm = None
+        data = {"id": test_id, "remote": remote, "arm": arm}
+        with open(RADIO_TEST_FILE, "w") as f:
+            json.dump(data, f)
+        for line in describe_radio_test(remote, arm):
+            print(line)
+        print(f"Raw data: {RADIO_TEST_FILE}")
+        if remote.get("err"):
+            raise RadioError(remote["err"])
+        return data
+
+    def test_result(self, prev=False):
+        """The arm's saved result of its last radio test (prev: the one
+        before it), or None."""
+        text, off = "", 0
+        while True:
+            part = self.request(["tr", off] + (["prev"] if prev else []), 5,
+                                retry=False)[1]
+            if part is None:
+                return None
+            text += part["d"]
+            off += len(part["d"])
+            if off >= part["n"] or not part["d"]:
+                return json.loads(text)
+
     def hand_to_remote(self):
         """Give control back to the stock remote and its sticks."""
         print("Rebooting the arm into stick mode (until it is switched off and on)...")
@@ -1181,26 +1340,47 @@ class RadioSession:
         """
         remote = json.loads(self.link.exec(
             "import json, network\n"
-            "try:\n"
-            " _c = network.WLAN(network.STA_IF).config('channel')\n"
-            "except Exception:\n"
-            " _c = None\n"
-            "print(json.dumps({'st': list(_b.e.stats()), 'rssi': _b.rssi(), "
-            "'ch': _c}))\n"
-            "del _c").strip().splitlines()[-1])
+            "_w = {}\n"
+            "for _k, _f in (('ch', lambda: network.WLAN(network.STA_IF).config('channel')),\n"
+            "               ('pm', lambda: network.WLAN(network.STA_IF).config('pm')),\n"
+            "               ('on', lambda: int(network.WLAN(network.STA_IF).active())),\n"
+            "               ('tx', lambda: network.WLAN(network.STA_IF).config('txpower'))):\n"
+            " try:\n"
+            "  _w[_k] = _f()\n"
+            " except Exception:\n"
+            "  pass\n"
+            "_w.update({'st': list(_b.e.stats()), 'rssi': _b.rssi(), "
+            "'wr': getattr(_b, 'wr', None), "
+            "'hb': json.loads(_b.hbstat()) if hasattr(_b, 'hbstat') else None})\n"
+            "print(json.dumps(_w))\n"
+            "del _w, _k, _f").strip().splitlines()[-1])
         out = {"remote": remote, "status": None, "arm": None, "prev": None,
-               "error": None}
+               "mem": None, "error": None}
         try:
             out["status"] = self.request(["p"], 5, retry=False)[0]
             out["arm"] = self.request(["d"], 5, retry=False)[1]
             out["prev"] = self.request(["d", "prev"], 5, retry=False)[1]
+            try:
+                out["mem"] = self.request(["m"], 5, retry=False)[1]
+            except DeviceError:
+                out["mem"] = None       # older arm code: no "m"
         except (RadioError, DeviceError) as e:
             out["error"] = str(e)
             if "unknown op" in out["error"]:
                 out["error"] += " (the arm's radio code is older; run 'update')"
 
         print(f"Remote: ESP-NOW {_counters(remote['st'])}; signal "
-              f"{remote['rssi']} dBm, channel {remote['ch']}.")
+              f"{remote['rssi']} dBm.")
+        wifi = _wifi_text(remote)
+        if wifi:
+            print("Remote Wi-Fi: " + wifi)
+        hb = remote.get("hb")
+        if hb:
+            print(f"Remote heartbeat: sent {hb['hb'][0]}, acked by the arm "
+                  f"{hb['hb'][1]}; unacked in a row now {hb['run']}")
+            for start, ms in hb["gaps"]:
+                print(f"  gap of {ms / 1000:.1f} s, "
+                      f"{(hb['now'] - start) / 1000:.0f} s ago")
         status = out["status"]
         if status:
             if status.get("radio_error"):
@@ -1218,6 +1398,8 @@ class RadioSession:
                     print("  " + line)
             else:
                 print("Arm: no snapshot from before this boot.")
+        for line in describe_memory(out["mem"]):
+            print(line)
         if out["error"]:
             print("Could not read the arm:", out["error"])
         return out
@@ -1270,14 +1452,157 @@ def describe_diag(d, snapshot=False):
         lines.append(f"  incident at {_span(up_s * 1000)}"
                      + (" while moving" if moving else "")
                      + f": {fixes.get(step, step)}")
-    wifi = [f"channel {d['ch']}"] if "ch" in d else []
-    if "pm" in d:
-        wifi.append(f"power save {d['pm']}")
-    if "ap" in d:
-        wifi.append("AP on" if d["ap"] else "AP off")
+    if "rk" in d:
+        lines.append(f"link set up again while idle {d['rk']} times")
+    wifi = _wifi_text(d)
     if wifi:
-        lines.append("Wi-Fi: " + ", ".join(wifi))
+        lines.append("Wi-Fi: " + wifi)
     return lines
+
+
+def _low_avg_high(xs):
+    vals = [x for x in xs if x is not None]
+    if not vals:
+        return "-"
+    return f"low {min(vals)} / avg {sum(vals) / len(vals):.1f} / high {max(vals)}"
+
+
+def _quiet_seconds(per):
+    """Seconds (as text ranges) in which nothing got through."""
+    out, start = [], None
+    for i, n in enumerate(per + [1]):
+        if not n and start is None:
+            start = i
+        elif n and start is not None:
+            out.append(f"{start}" if i - 1 == start else f"{start}-{i - 1}")
+            start = None
+    return ", ".join(out) if out else "none"
+
+
+def describe_radio_test(remote, arm):
+    """A radio-test result (Bridge.rtest, RadioTest.result) as text lines."""
+    lines = []
+    if remote and remote.get("err"):
+        lines.append(f"Remote: {remote['err']} within {remote['wait'] / 1000:.0f} s; "
+                     f"while waiting, the arm's radio acked {remote['wait_ack']} of "
+                     f"{remote['wait_sent']} packets"
+                     + (" (no radio contact)" if not remote["wait_ack"] else
+                        " (its radio heard them; nothing came back)"))
+    elif remote:
+        sent, ack, back = sum(remote["sent"]), sum(remote["ack"]), sum(remote["back"])
+
+        def pct(n):
+            return f"{100 * n / sent:.1f}%" if sent else "-"
+        lines += [
+            f"Remote: {remote['n']} s at {remote['rate']} packets/s; the arm's test "
+            f"mode answered after {remote['wait'] / 1000:.1f} s",
+            f"  sent {sent}; per second {_low_avg_high(remote['sent'])}",
+            f"  acked by the arm's radio {ack} ({pct(ack)}); per second "
+            f"{_low_avg_high(remote['ack'])}",
+            f"  longest with no ack {remote['ack_gap'][0] / 1000:.1f} s, from "
+            f"{remote['ack_gap'][1] / 1000:.0f} s; seconds with no ack: "
+            f"{_quiet_seconds(remote['ack'])}"]
+        if remote.get("echo"):
+            lines += [
+                f"  echoed back by the arm {back} ({pct(back)}); per second "
+                f"{_low_avg_high(remote['back'])}",
+                f"  longest with no echo {remote['echo_gap'][0] / 1000:.1f} s, from "
+                f"{remote['echo_gap'][1] / 1000:.0f} s; seconds with no echo: "
+                f"{_quiet_seconds(remote['back'])}",
+                f"  signal (dBm) {_low_avg_high(remote['rssi'])}"]
+        rows = remote["ack"]
+        lines.append("  acked per second:")
+        for i in range(0, len(rows), 20):
+            lines.append(f"    {i:4}s: " + " ".join(f"{n:2}" for n in rows[i:i + 20]))
+    if arm:
+        if arm.get("w0"):
+            lines.append(f"Arm Wi-Fi as the test started: {_wifi_info_text(arm['w0'])}")
+        lines += [
+            f"Arm (test mode, {arm['s']} s): received {arm['rx']} test packets; per "
+            f"second {_low_avg_high(arm['per'])}",
+            f"  missed by sequence number {arm['lost']}; first after "
+            f"{(arm['first'] or 0) / 1000:.1f} s; longest gap {arm['gap'][0] / 1000:.1f} s, "
+            f"from {arm['gap'][1] / 1000:.0f} s; seconds with nothing: "
+            f"{_quiet_seconds(arm['per'])}",
+            f"  its echoes acked {arm['ok']}, not acked {arm['nak']}; other "
+            f"messages {arm['ign']}"]
+    elif arm is None and remote:
+        lines.append("Arm: its counts could not be read.")
+    return lines
+
+
+WLAN_STATUS = {1000: "idle", 1001: "connecting", 1010: "got IP", 200: "beacon timeout",
+               201: "no AP found", 202: "wrong password", 203: "assoc fail",
+               204: "handshake timeout"}
+
+
+def _wifi_info_text(w):
+    """arm_radio.wifi_info() as text."""
+    sta_on, sta_ch, status, ssid, ap_on, ap_ch = w
+
+    def onoff(v):
+        return "?" if v == -1 else ("on" if v else "off")
+    return (f"station {onoff(sta_on)}, channel {sta_ch}, "
+            f"{WLAN_STATUS.get(status, status)}"
+            + (f", saved network {ssid!r}" if ssid not in ("", -1, None) else "")
+            + f"; access point {onoff(ap_on)}, channel {ap_ch}")
+
+
+def describe_memory(m):
+    """The arm's "m" reply (see arm_radio.Server.memory) as text lines."""
+    if not m:
+        return []
+
+    def kb(n):
+        return "?" if n is None else f"{n / 1024:.1f} KB"
+
+    def at(ms):
+        return "" if ms is None else f" (at {_span(ms)} after boot)"
+    gc_now, gc_used, gc_low, gc_at = m["gc"]
+    sys_now, sys_low, sys_at = m["sys"]
+    lines = [f"Arm memory: MicroPython heap {kb(gc_now)} free, {kb(gc_used)} in use, "
+             f"lowest {kb(gc_low)}{at(gc_at)}",
+             f"  system heap (Wi-Fi buffers) {kb(sys_now)} free, lowest "
+             f"{kb(sys_low)}{at(sys_at)}"]
+    if m.get("wifi"):
+        lines.append(f"Arm Wi-Fi: {_wifi_info_text(m['wifi'])}")
+    if isinstance(m.get("hp"), list):
+        for total, free, largest, low in m["hp"]:
+            lines.append(f"    region {kb(total)}: {kb(free)} free, largest block "
+                         f"{kb(largest)}, lowest since boot {kb(low)}")
+    elif m.get("hp"):
+        lines.append(f"    regions not readable: {m['hp']}")
+    return lines
+
+
+def _wifi_text(d):
+    """On/off, channel, power save and start-up path from a diagnostics dict.
+
+    "OFF" means ESP-NOW can neither send nor hear (the channel then reads 1
+    whatever was set). power save should read 0: anything else lets the
+    radio doze and miss messages. "gentle start" means Wi-Fi was not switched
+    off and on at start-up: arm_radio.START_FULL is off, or /arm_wifi_try was
+    left by a start that hung the board ('radio-install' / 'radio-pair' clear
+    it). (Older arm
+    files sent "ap", whether the access point was on; on this firmware that
+    is the same radio as the station, so it is not shown.)"""
+    wifi = []
+    if d.get("on") is not None:
+        wifi.append("on" if d["on"] else "OFF")
+    if d.get("ch") is not None:
+        wifi.append(f"channel {d['ch']}")
+    if d.get("pm") is not None:
+        wifi.append(f"power save {d['pm']}")
+    if d.get("tx") is not None:
+        wifi.append(f"transmit power {d['tx']:g} dBm")
+    if d.get("txe"):
+        wifi.append(f"setting the transmit power failed: {d['txe']}")
+    if d.get("en") == 0:
+        wifi.append("UNENCRYPTED")
+    if d.get("wr") is not None:
+        wifi.append("full reset at start-up" if d["wr"]
+                    else "gentle start (no Wi-Fi off and on)")
+    return ", ".join(wifi)
 
 
 def _stop_on_ctrl_c(session, job):
@@ -1367,6 +1692,7 @@ def radio_pair(link, pair, channel=None):
     session.write_file(BRIDGE_PATH, compile_file(BRIDGE_LIB, board_mpy))
     link.exec("import sys\nsys.modules.pop('arm_bridge', None)\nimport arm_bridge", timeout=15)
     session.install_boot_hook(board_mpy)
+    session.remove_files(WIFI_MARK)
     link.exec(f"with open({MODE_FILE!r}, 'w') as _f:\n _f.write('bridge')")
     save_pair(pair)
     print(f"Remote {mac} is set up as the radio bridge (channel {pair['channel']}).")
@@ -1567,11 +1893,15 @@ SESSION_COMMANDS = {
     "debug":     "debug                        radio: both boards' radio counters (read only)",
     "update":    "update [--force]             radio: send changed board code to the arm",
     "remote":    "remote                       radio: hand the arm to the stick remote",
+    "radio-test": "radio-test SECONDS [RATE] [--no-echo]  radio: only-the-radio test for SECONDS, then back to radio mode",
+    "radio-test-result": "radio-test-result [--prev]   radio: the arm's counts from its last radio test (or the one before)",
+    "radio-set": "radio-set CHANNEL [TXPOWER] [--plain|--encrypted]  radio: move both boards to a channel (1-13), power in dBm, (un)encrypted",
 }
 # Old command names that still work.
 ALIASES = {"claw-cal": "claw-set", "base-calibrate": "base-tune"}
 USB_ONLY = {"install", "uninstall", "probe", "radio-pair", "radio-install"}
-RADIO_ONLY = {"ping", "debug", "update", "remote"}
+RADIO_ONLY = {"ping", "debug", "update", "remote", "radio-set", "radio-test",
+              "radio-test-result"}
 CALIBRATIONS = {}   # filled in below: name -> function(session)
 
 
@@ -2296,6 +2626,40 @@ def _main(opts):
             return 0, extra
         if opts.command == "remote":
             session.hand_to_remote()
+            return 0, extra
+        if opts.command == "radio-test":
+            flags = [a for a in opts.args if a.startswith("--")]
+            args = [a for a in opts.args if not a.startswith("--")]
+            _need(args, 1, "radio-test SECONDS [RATE] [--no-echo]")
+            if set(flags) - {"--no-echo"}:
+                raise UsageError("radio-test takes --no-echo")
+            seconds = _num(args[0], "seconds")
+            rate = _num(args[1], "rate") if len(args) > 1 else 50
+            if seconds != int(seconds) or not 2 <= seconds <= 1800:
+                raise UsageError("seconds must be a whole number, 2-1800")
+            if not 1 <= rate <= 200:
+                raise UsageError("rate must be 1-200 packets a second")
+            extra["radio_test"] = session.radio_test(int(seconds), int(rate),
+                                                     "--no-echo" not in flags)
+            return 0, extra
+        if opts.command == "radio-test-result":
+            arm = session.test_result(prev="--prev" in opts.args)
+            for line in describe_radio_test(None, arm) if arm else ["No radio test result on the arm."]:
+                print(line)
+            extra["radio_test"] = {"arm": arm}
+            return 0, extra
+        if opts.command == "radio-set":
+            flags = [a for a in opts.args if a.startswith("--")]
+            args = [a for a in opts.args if not a.startswith("--")]
+            _need(args, 1, "radio-set CHANNEL [TXPOWER] [--plain|--encrypted]")
+            if set(flags) - {"--plain", "--encrypted"} or len(flags) > 1:
+                raise UsageError("radio-set takes --plain or --encrypted")
+            enc = None if not flags else int(flags[0] == "--encrypted")
+            channel = _num(args[0], "channel")
+            if channel != int(channel) or not 1 <= channel <= 13:
+                raise UsageError("channel must be 1-13")
+            txpower = _num(args[1], "txpower") if len(args) > 1 else None
+            extra["status"] = _public(session.set_radio(int(channel), txpower, enc))
             return 0, extra
         if opts.command == "gesture":
             extra["before"] = session.status()

@@ -45,6 +45,10 @@ board.
 pip install -r requirements.txt   # pyserial, mpy-cross
 ```
 
+On Linux your user must be in the `dialout` group to open `/dev/ttyACM0`. On WSL, attach
+each board to Linux with `usbipd.exe list` and `usbipd.exe attach --wsl --busid <id>`;
+the remote and the arm are separate USB devices, so attach whichever one is plugged in.
+
 ### Radio (USB to the arm only once)
 
 1. **Pair the remote.** Plug USB into the CyberBrick **remote** and run:
@@ -148,8 +152,11 @@ themselves after 20 seconds, in case the stop command is lost.
 | `radio-pair [CH]`   | USB in the remote: set it up as the radio bridge                     |
 | `radio-install`     | USB in the arm, once: install radio mode and reboot into it          |
 | `ping`              | Check the link: reply time, signal strength, free RAM, why the arm last restarted |
-| `debug`             | Read both boards' radio counters and the arm's last snapshot from before it restarted (read-only). Run it right after a radio failure, before switching anything off: see [Radio diagnostics](#radio-diagnostics) |
+| `debug`             | Read both boards' radio counters, the remote's heartbeat log, the arm's memory and Wi-Fi state, and its last snapshot from before it restarted (read-only). Run it right after a radio failure, before switching anything off: see [Radio diagnostics](#radio-diagnostics) |
 | `update [--force]`  | Send edited `cyberbrick_arm.py` / `arm_radio.py` to the arm over the radio |
+| `radio-set CH [TXPOWER] [--plain\|--encrypted]` | Move both boards to another channel (1-13), transmit power (2-20 dBm) and/or encryption, over the radio: see [Radio settings](#radio-settings) |
+| `radio-test SECONDS [RATE] [--no-echo]` | Measure the bare radio link for 2-1800 s, with nothing else running on the arm: see [Radio test](#radio-test) |
+| `radio-test-result [--prev]` | Show the arm's counts from its last radio test (or the one before) |
 | `remote`            | Hand the arm to the stick remote until the arm is switched off and on |
 
 ### Other
@@ -270,7 +277,48 @@ python arm_serial.py --transport usb --port COM5 home
   number, so one that is sent again is never run twice. The arm sends its status back when
   the move has finished, and `stop` still gets through while a move is running.
 - **Security.** The link is ESP-NOW unicast, encrypted with the keys from `radio-pair`,
-  and the arm ignores every board except its paired remote.
+  and the arm ignores every board except its paired remote. (`radio-set ... --plain`
+  turns the encryption off for testing; then anyone nearby who knows the remote's address
+  could send the arm commands, so switch it back with `--encrypted`.)
+- **Message size.** ESP-NOW carries at most 250 bytes per message. The largest request
+  is an `update` piece (217 bytes); the remote refuses anything longer with "request too
+  long" instead of sending it, and the arm replaces a reply that would be too long with
+  an error.
+- **A remote that was just switched on is restarted once.** After a power-on (plugged
+  in, or switched on) the remote's radio loses more and more messages: about 1 in 10 at
+  first, every one within 2 minutes, at any transmit power, and switching Wi-Fi off and
+  on does not cure it. One restart of the chip does. So the first radio command after
+  the remote is switched on prints "The remote was just switched on ... restarting it"
+  and takes about 3 s longer; after that the remote is used as it is.
+- **Wi-Fi at start-up.** The stock firmware starts Wi-Fi before radio mode or the bridge
+  runs, with power saving on (the radio dozes and misses messages). Both boards then:
+  - switch the station on (the remote switches it off and on first; the arm only
+    switches it on if it is off),
+  - set `reconnects=0` and disconnect, so the station never looks for a network,
+  - put it on the paired channel, turn power saving off (`pm=PM_NONE`) and set the
+    transmit power from the pairing (`radio-set`; otherwise the firmware's 20 dBm),
+  - start ESP-NOW with a 2048-byte receive buffer (room for 7 full-size messages).
+
+  The access point stays on. On this firmware it follows the station: switching it off
+  stops the station too, and switching the station back on brings it back (measured on
+  both boards). If Wi-Fi does not end up on and on the paired channel, the board stops
+  with "Wi-Fi did not start on channel N" instead of running deaf (the arm then falls
+  back to its previous radio files). If the remote ever hangs at its off-and-on step,
+  switch it off and on: it finds `/arm_wifi_try` left behind and from then on starts the
+  gentle way; `radio-pair` clears the file.
+- **Either board can restart on its own.** The remote, powered over USB, usually outlives
+  the arm being switched off and on, and the other way round. Afterwards the side that
+  stayed on can hold stale link state for the other. So the remote adds the arm as a
+  peer again at the start of every command session, and when an acked request gets no
+  answer for 2 s. (The arm can do the same after 3 s without hearing the remote,
+  `IDLE_REKEY` in `arm_radio.py`; it is off, since it made no difference.) The remote
+  keeps resending (same sequence number) for 10 s once the arm's radio has acked, which
+  also covers a command sent while the arm is still starting up; with no ack at all it
+  gives up after 5 s ("no radio contact").
+- **Heartbeat.** While the bridge runs, the remote sends the arm a 1-byte message once a
+  second (`HEARTBEAT_MS` in `arm_bridge.py`), which the arm ignores. The remote counts
+  which ones the arm's radio acknowledges and logs every stretch of 2 or more in a row
+  that it didn't, so `debug` can show when the link went quiet and for how long.
 - **Recovery without USB.**
   - If radio mode fails to start, the hook tries the copies kept from before the last
     `update`, then falls back to the stock firmware. A crash that reboots the board moves on
@@ -280,7 +328,8 @@ python arm_serial.py --transport usb --port COM5 home
   - After `remote` the arm runs the stock firmware for one boot.
   - `uninstall` over USB removes everything.
 - **Updates.** `update` sends the compiled files in 150-byte pieces, checks their sha256,
-  and swaps them in. The previous copy is kept as `*_old.mpy` for the fallback.
+  and swaps them in. The previous copy is kept as `*_old.mpy` for the fallback. Changing
+  a comment counts as a change too: the next `update` sends the file again.
 
 ## Radio diagnostics
 
@@ -293,27 +342,37 @@ python arm_serial.py debug
 A board loses its counters when it restarts, and `debug` is careful not to cause one: it
 sends nothing again, and if nothing reaches the arm it doesn't restart the remote (other
 commands restart it once then). It only restarts the remote when the remote is in
-stick mode or was soft-reset, because then it has to before it can talk to the bridge. It reads the remote first, before its
+stick mode, was soft-reset or was just switched on, because then it has to before it can talk to the bridge. It reads the remote first, before its
 own requests add any traffic, then asks the arm for its counters (`"d"`) and for the
 snapshot it saved before its last restart (`"d", "prev"`). If the arm doesn't answer,
 the remote's half is still printed, along with the error. With `--json`, the readings are
-in a `debug` object: `remote`, `status`, `arm`, `prev` and `error`.
+in a `debug` object: `remote`, `status`, `arm`, `prev`, `mem` and `error`.
 
 Example output:
 
 ```text
-Remote: ESP-NOW sent 164, send results 1002, failed results 453, received 125, dropped 0; signal -26 dBm, channel 6.
+Remote: ESP-NOW sent 138, send results 138, failed results 46, received 91, dropped 0; signal -39 dBm.
+Remote Wi-Fi: on, channel 1, power save 0, transmit power 20 dBm, full reset at start-up
+Remote heartbeat: sent 1185, acked by the arm 945; unacked in a row now 0
+  gap of 19.7 s, 61 s ago
+  gap of 2.5 s, 41 s ago
 Arm, this boot:
-  boot 40211, up 25m 5s, main loop 118230 rounds
-  requests heard 86, ignored 0, last one 2s ago
-  ESP-NOW sent 97, send results 240, failed results 31, received 86, dropped 0
-  reply sends while moving 13, of them not acked 2
-  replies given up on 1; recovery: radio restart fixed 1 of 1, Wi-Fi restart fixed 0 of 0
-    incident at 15m 12s while moving: radio restart
-  Wi-Fi: channel 6, power save 1, AP on
+  boot 14740, up 2m 49s, main loop 16050 rounds
+  requests heard 36, ignored 957, last one 0s ago
+  ESP-NOW sent 46, send results 46, failed results 13, received 994, dropped 0
+  reply sends while moving 0, of them not acked 0
+  replies given up on 2; recovery: radio restart fixed 0 of 2, Wi-Fi restart fixed 2 of 2
+    incident at 16s: Wi-Fi restart
+    incident at 2m 9s: Wi-Fi restart
+  Wi-Fi: on, channel 1, power save 0, transmit power 20 dBm
 Arm, last snapshot from before this boot:
-  boot 64428, saved after 28m 3s, main loop 131002 rounds, saved just before a recovery reboot
+  boot 31553, saved after 3m 5s, main loop 17717 rounds
   ...
+Arm memory: MicroPython heap 47.0 KB free, 41.3 KB in use, lowest 18.3 KB (at 7s after boot)
+  system heap (Wi-Fi buffers) 41.1 KB free, lowest 41.1 KB (at 1s after boot)
+Arm Wi-Fi: station on, channel 1, idle; access point on, channel 1
+    region 118.2 KB: 18.7 KB free, largest block 18.0 KB, lowest since boot 18.6 KB
+    ...
 ```
 
 What the lines mean:
@@ -325,8 +384,12 @@ What the lines mean:
 | `last one ... ago` | Time since the arm last heard a request |
 | `reply sends while moving` | Reply sends tried while a joint, the claw or the base was moving, and how many of them got no ack. Each reply is tried up to 3 times |
 | `replies given up on` | Replies that failed all 3 tries. Each one starts a recovery (below) |
-| `recovery`, `incident` | How often each recovery step was tried and how often it worked, then the last 3 incidents: uptime, whether something was moving, and the step that fixed it |
-| `Wi-Fi` | Channel, power-save mode, and whether the Wi-Fi access-point interface is on |
+| `recovery`, `incident` | How often each recovery step was tried and how often it worked, then the last 3 incidents: uptime, whether something was moving, and the step that fixed it (`not fixed yet` when both steps failed) |
+| `Remote heartbeat` | Heartbeats sent and acked by the arm's radio, how many in a row are unacked right now, and the last 8 gaps of 2 s or more with how long ago they were |
+| `Wi-Fi` | `on` or `OFF` (OFF: the board can neither send nor hear), channel (should match the pair, 1 by default), power-save mode (should be 0), transmit power, `UNENCRYPTED` if the link is set to plain, and for the remote how its Wi-Fi started (`full reset at start-up`, or `gentle start` after a start that hung) |
+| `Arm memory` | MicroPython heap and the system heap the Wi-Fi driver uses: free now, and the lowest seen this boot (sampled every second; each region's lowest point is ESP-IDF's own exact count) |
+| `Arm Wi-Fi` | Station on/off, channel, status (`idle` = not looking for a network), a saved network name if any, and the access point |
+| `link set up again while idle` | Only if `IDLE_REKEY` is on: times the arm re-added the remote as a peer |
 | `ESP-NOW ...` | The raw counters from the radio driver (`ESPNow.stats()`) |
 
 The raw ESP-NOW counters don't count sends one for one on this firmware. Measured on the
@@ -335,18 +398,22 @@ remote, a send acked on its first try can still add 0-2 to both "send results" a
 time apart instead, and use `reply sends while moving` and `replies given up on` for the
 arm's own sends.
 
-The arm sometimes leaves fields out (`ignored`, power save, AP, `replies given up on`,
-the incidents, the moving counts), because the reply has to fit in one radio message.
+The arm sometimes leaves fields out (`ignored`, power save, Wi-Fi on/off,
+`replies given up on`, the incidents, the moving counts), because the reply has to fit in
+one radio message. The memory and Wi-Fi interface lines come from a separate request, so
+they are always complete.
 
 **Self-recovery.** When a reply fails all 3 tries, the arm works to get its radio
 back. After each step it waits 1.6 s to hear the remote again:
 
 1. Restart ESP-NOW.
 2. Restart Wi-Fi, then ESP-NOW.
-3. Reboot into radio mode. Just before it reboots, the arm saves the snapshot and the
-   joint angles (`/arm_hold.json`), so the joints stay where they were instead of going
-   home. The angles are only put back after this reboot, never after switching the arm
-   off and on.
+
+If neither works, the arm carries on and starts again at step 1 with the next failed
+reply. It never restarts itself: a third step that rebooted into radio mode
+(`RECOVER_REBOOT` in `arm_radio.py`) is off, because it moved the arm without warning.
+(When on, it saves the joint angles to `/arm_hold.json` first and puts them back after
+that reboot only.)
 
 **The snapshot.** Every 30 s, while nothing is moving, the arm overwrites one small file,
 `/arm_diag.json`, with the same counters `debug` shows (always under 250 bytes). It skips
@@ -354,20 +421,85 @@ this if the flash has less than 64 KB free, and `uninstall` removes the file. Af
 outage that needed the arm switched off and on, the "last snapshot from before this
 boot" shows what the arm saw just before.
 
-## Choosing a radio channel
+## Radio settings
 
 The link uses one 2.4 GHz Wi-Fi channel (default 1). Wi-Fi networks on the same or a
-nearby channel (up to 4 channels away) collide with it. The link sends again and keeps
-trying for 5 seconds, but a busy network close by can still cause "no reply from the
-arm" now and then. Pick a channel at least 5 away from the strong networks around you
-(1, 6 and 11 are the usual choices), then set it on both boards:
+nearby channel (up to 4 channels away) can collide with it; 1, 6 and 11 are the usual
+choices. Change the channel, transmit power or encryption on both boards over the radio,
+with USB in the remote only:
 
 ```bash
-python arm_serial.py radio-pair 6      # USB in the remote; keeps the same keys
-python arm_serial.py radio-install     # USB in the arm, once more
+python arm_serial.py radio-set 6             # channel 6
+python arm_serial.py radio-set 1 8.5         # channel 1, 8.5 dBm (2-20; the default is 20)
+python arm_serial.py radio-set 1 --plain     # unencrypted, for testing only
+python arm_serial.py radio-set 1 --encrypted # back to encrypted
 ```
 
-The arm cannot be reached over the radio between those two steps.
+The arm saves the new settings in `/arm_radio.json` and restarts on them, the remote
+follows, and the PC saves them in `.radio_pair.json` once the arm answers. If the arm does
+not answer within 2 minutes, the remote goes back to the old settings and the error says
+which ones the arm saved: run `radio-set` with those to move the remote to it.
+
+## Radio test
+
+`radio-test` measures the bare radio link, with nothing else running on the arm:
+
+```bash
+python arm_serial.py radio-test 30           # 30 s at 50 packets a second, echoed back
+python arm_serial.py radio-test 30 20        # 20 packets a second
+python arm_serial.py radio-test 30 --no-echo # one way only: does the arm's radio hear them?
+python arm_serial.py radio-test-result --prev
+```
+
+- **The arm** restarts into radio-test mode (dim purple light): only Wi-Fi and ESP-NOW
+  run, with no arm library, servo timer, diagnostics or recovery. **The servos are not
+  driven, so the joints may sag; put the arm in a resting position first.** It counts each
+  numbered test packet and echoes it back, then saves its counts and restarts into radio
+  mode by itself (the joints go home).
+- **Switching the arm off and on always starts radio mode.** The test request is removed
+  before the test begins, and a power-on never starts a test.
+- **The remote** sends numbered packets at the rate asked and counts, per second, how many
+  the arm's radio acknowledged and how many came back. Each unacknowledged send blocks
+  while the radio retries (about 80 ms), so the real rate can be lower than asked.
+- **The PC** prints both sides: totals, per-second low / average / high, the seconds in
+  which nothing got through, the longest gap, signal strength, and the arm's Wi-Fi state as
+  the test started. The raw data goes to `.radio_test_last.json` (git-ignored). If the
+  arm's test mode stayed silent, the remote's half still says whether the arm's radio
+  acknowledged anything while it waited.
+- **The arm keeps** its last result and the one before (`radio-test-result --prev`).
+
+The remote's heartbeat keeps running during a test; the arm counts those as "other
+messages".
+
+## Known problem: deaf spells
+
+The radio link loses packets and has "deaf spells": for anything from a few seconds to
+two minutes the arm's radio acknowledges nothing, although the arm keeps running. They
+come and go, after a power-on, a restart or in the middle of a session. Then commands fail
+with "no radio contact" or are slow, and `debug` shows heartbeat gaps and recovery
+incidents. When the arm hears the remote again, its first reply usually fails and the
+Wi-Fi restart step brings the link back.
+
+Measured so far (2026-11-11 to 11-22; one or a few short runs each):
+
+- **Not the cause:** the arm's start-up order, power saving, the receive-buffer size,
+  the idle re-key, the transmit power, the channel (1 and 6), encryption, constant traffic
+  (a heartbeat at 10 a second), and memory (the system heap's exact low point did not
+  move during a 20 s spell). Restarting the remote doesn't end a spell; the arm side is
+  the stuck one.
+- **Not the rest of radio mode:** in radio-test mode, with only the radio running, about
+  30-40 % of packets went unacknowledged even at a strong signal, and one test heard
+  nothing at all for 30 s from start-up.
+- **Not possible to test from MicroPython on this firmware:** station-only Wi-Fi (the
+  access point always comes back with the station), and whether the firmware has
+  Bluetooth running (no `bluetooth` module; Bluetooth shares the radio). Espressif's
+  ESP32-C3 coexistence table calls ESP-NOW reception stable only in station mode.
+- **Open:** interference from nearby networks (try `radio-test` on channels 1, 6 and 11,
+  or in another room), and how the stock firmware sets up its radio on the arm. On the
+  stock remote: channel 1, power saving off, 20 dBm, 2 peers, both unencrypted.
+
+The arm's battery ran flat once during these measurements, so some numbers may have been
+taken on a weak battery.
 
 ## Space on the board
 
@@ -375,19 +507,22 @@ Measured on the receiver (ESP32-C3, MicroPython 1.23):
 
 | Resource                         | USB mode (beside the stock firmware) | Radio mode, arm and radio running |
 | -------------------------------- | ------------------------------------ | --------------------------------- |
-| Free MicroPython RAM             | 30.5 KB                              | **60.5 KB** (steady over 400 messages) |
-| Flash free (of 956 KB)           | 768 KB                               | ~756 KB                           |
+| Free MicroPython RAM             | 30.5 KB                              | **~43 KB** (2026-11-22, with the 2048-byte ESP-NOW buffer; 60.5 KB with the first, smaller radio code) |
+| Flash free (of 956 KB)           | 768 KB                               | ~750 KB (not re-measured since the radio code grew) |
 
 Our files in flash:
 
 | File                        | Size                                      |
 | --------------------------- | ----------------------------------------- |
 | `cyberbrick_arm.mpy`        | 7.0 KB                                    |
-| `arm_radio.mpy`             | 4.7 KB                                    |
-| `/lib/rc_main.mpy`          | 1.1 KB                                    |
-| Settings, version and diagnostics files | < 1 KB                        |
-| `*_old.mpy` after an update | up to 12 KB more                          |
-| Remote: `arm_bridge.mpy`    | 1.1 KB, plus the 1.1 KB hook              |
+| `arm_radio.mpy`             | 11.3 KB                                   |
+| `/lib/rc_main.mpy`          | 1.3 KB                                    |
+| Settings, version, diagnostics and radio-test files | < 2 KB            |
+| `*_old.mpy` after an update | up to 18.5 KB more                        |
+| Remote: `arm_bridge.mpy`    | 3.4 KB, plus the 1.3 KB hook              |
+
+The system heap that the Wi-Fi driver uses is separate from MicroPython's; `debug` shows
+both. On the arm it stays at about 41 KB free.
 
 Radio mode has more RAM than USB mode because the stock remote-control app (and the
 LED, executor and sleep parts of `bbl`) are not loaded; only `bbl`'s servo and motor files
@@ -479,6 +614,20 @@ If the base was moved by hand or with the remote, centre it and run
 `python arm_serial.py base-set 0`. If the claw estimate is wrong, open or close it fully
 and run `claw-set open` or `claw-set closed`.
 
+## Limitations
+
+- Each joint's fully extended position is set with the other joint at home. Whether the
+  upper arm can reach the table also depends on where the lower arm is, so leave a few
+  degrees spare.
+- Each command opens the serial port again (to the remote, or to the arm over USB),
+  which adds about a second. `shell` keeps it open.
+- Radio mode and the stick remote take turns. `remote` gives the arm to the sticks until
+  it is switched off and on. While the remote is the radio bridge, its sticks do nothing.
+- Pairing a different remote, or removing radio mode completely (`uninstall`), needs the
+  arm's USB cable again.
+- The radio link has intermittent deaf spells: see
+  [Known problem: deaf spells](#known-problem-deaf-spells).
+
 ## Tests
 
 The radio protocol, the bridge, the boot hook fallbacks and the command mapping are tested
@@ -493,13 +642,17 @@ on the PC against fakes of the MicroPython modules:
 | Problem                                  | Fix                                                          |
 | ---------------------------------------- | ------------------------------------------------------------ |
 | A joint hits the table, base or arm      | `arm-calibrate`                                              |
-| "No reply from the arm" now and then     | Run `debug` right away, before switching anything off, to see which side lost the messages ([Radio diagnostics](#radio-diagnostics)). If nearby Wi-Fi uses the same channel, try a clearer one ([Choosing a radio channel](#choosing-a-radio-channel)) |
+| "No reply from the arm" now and then     | Run `debug` right away, before switching anything off, to see which side lost the messages ([Radio diagnostics](#radio-diagnostics)). If nearby Wi-Fi uses the same channel, try a clearer one ([Radio settings](#radio-settings)). See also [Known problem: deaf spells](#known-problem-deaf-spells) |
+| Commands slow, or "no radio contact" for up to two minutes, then fine again | A deaf spell ([Known problem](#known-problem-deaf-spells)). Wait for it to end; the arm's Wi-Fi restart step usually brings the link back. `debug` afterwards shows the heartbeat gap |
 | Home pose is wrong                       | `arm-calibrate`, then `home`                                 |
 | A joint can't extend far enough; its home is mid-way (e.g. servo 100) | `arm-align`: re-seats the arm part on the servo so home is at servo 0 |
 | A joint won't move by hand / feels stuck | Normal while the battery is on: the servo holds its angle. Move it with commands (or `+`/`-` in `arm-calibrate`), or `release` to let the joints go limp |
 | A joint doesn't move when commanded, or buzzes | Check the battery is on and charged; the joint may be pressing on something, so step it back the other way |
-| Radio: "no reply from the arm"           | The arm's radio hears the remote but radio mode is not answering. If you ran `remote`, the arm stays in stick mode until it is switched off and on. Otherwise run `debug` first, then switch the arm off and on, then run `debug` again: its snapshot shows what the arm saw before the restart. |
-| Radio: "no radio contact with the arm, even after restarting the remote" | Nothing reached the arm. The PC already restarted the remote once (its radio can jam, for example after a soft reset from mpremote or Thonny). Check the arm is switched on and move the remote closer. |
+| Radio: "no reply from the arm"           | The arm's radio hears the remote, but nothing came back for 10 s, even after the remote set up the link again. If you ran `remote`, the arm stays in stick mode until it is switched off and on. Otherwise run `debug` first, then switch the arm off and on, then run `debug` again: its snapshot shows what the arm saw before the restart. If `debug` shows power save other than 0, say so in a bug report. |
+| Radio: the remote hung while starting, or `debug` says `gentle start` | Switch it off and on; it then starts Wi-Fi the gentle way. To try the full reset again, run `radio-pair` with USB in the remote |
+| Radio: "request too long"                | A request over ESP-NOW's 250-byte limit was refused before sending; nothing reached the arm. Shorter arguments, or report it as a bug |
+| `radio-test`: "no echo from the arm's test mode" | The arm's test mode stayed silent (a deaf spell, or the arm is off). The printout still shows whether its radio acknowledged anything; the arm goes back to radio mode by itself after the test time |
+| Radio: "no radio contact with the arm, even after restarting the remote" | Nothing reached the arm. The PC already restarted the remote once (its radio can jam, for example after a soft reset from mpremote or Thonny). Check the arm is switched on and move the remote closer. Then run `debug`: if the `Remote Wi-Fi` line shows `OFF` or a channel other than the pair's, the remote's radio is not where the arm listens; run `radio-pair` with USB in the remote. |
 | Radio: "Could not find the CyberBrick remote" | Plug USB into the paired remote, or pass `--port`       |
 | Radio: "this board is a receiver"        | The cable is in the arm; move it to the remote               |
 | Radio: stick remote does nothing         | The remote is in bridge mode: run `remote` to hand back to the sticks |
