@@ -2,5 +2,6 @@ __pycache__/
 src/.port_cache
 .venv/
 src/.arm_state.json
+src/.radio_test_last.json
 openclaw-plugin/node_modules/
 src/.radio_pair.json

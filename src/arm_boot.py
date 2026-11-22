@@ -21,6 +21,10 @@ On the arm (receiver):
     would look like it is running while the remote gets no reply.
 
 On the remote (transmitter):
+  * after a power-on (plugged in, or switched on): one restart first. Its
+    radio started from power-on loses more and more messages (every one
+    within about 2 minutes, at any transmit power, and Wi-Fi off and on does
+    not help); after one restart it is fine. COLD_MARK makes it only one;
   * MODE_FILE says "bridge": do nothing and wait at the REPL for the PC
     (arm_bridge.py does the radio work);
   * otherwise: the stock firmware.
@@ -33,6 +37,7 @@ import machine
 
 MODE_FILE = "/arm_mode"
 COUNT_FILE = "/arm_boot"
+COLD_MARK = "/arm_cold"     # remote: written just before the power-on restart
 
 # (radio module, arm library) to try, in order.
 TRIES = (
@@ -122,10 +127,27 @@ def _receiver():
     return False
 
 
+def _cold_restart():
+    """Remote: restart once after a power-on (see the module docstring).
+
+    The boot after the restart finds COLD_MARK and only removes it, so this
+    can never loop, even if the reset cause read wrong. If the mark cannot
+    be written (flash full), there is no restart; the PC then restarts the
+    remote itself (arm_serial.RadioSession._ensure_bridge)."""
+    if _read(COLD_MARK):
+        _remove(COLD_MARK)
+        return
+    if _power_on():
+        _write(COLD_MARK, "1")
+        if _read(COLD_MARK):
+            machine.reset()
+
+
 def main():
     try:
         mode = _read(MODE_FILE)
         if machine.Pin(10, machine.Pin.IN).value():     # the remote
+            _cold_restart()
             if mode == "bridge":
                 print("[arm] bridge mode: waiting for arm_serial.py")
                 return
